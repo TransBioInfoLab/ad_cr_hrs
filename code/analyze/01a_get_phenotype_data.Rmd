@@ -1,0 +1,173 @@
+---
+title: "Read HRS phenotype information, and save key columns to a dataframe"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(haven)
+  library(dplyr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+hrs_dir <- file.path(base_dir, "DATASET", "HRS", "Phenotype")
+data_dir <- file.path(analysis_dir, "data")
+
+stopifnot(dir.exists(hrs_dir))
+if (!dir.exists(data_dir)) dir.create(data_dir, recursive = TRUE)
+```
+
+# Get Phenotype Information
+
+```{r read_pheno}
+pheno_df <- haven::read_sas(
+  file.path(hrs_dir, "RAND_longitudinal", "randhrs1992_2022v1.sas7bdat")
+) %>%
+  dplyr::select(
+    "HHID",
+    "PN",
+    "RAGENDER",
+    "RARACEM",
+    "RAHISPAN",
+    "RABYEAR",
+    "RABMONTH",
+    "R13AGEY_E",
+    "RAEDUC",
+    "RAEDYRS",
+    "R13SMOKEV",
+    "R13SMOKEN"
+  )
+```
+
+# Get Dementia Status
+
+```{r read_dementia}
+dem_df <- haven::read_dta(
+  file.path(hrs_dir, "HCAP", "LangaWeir2022v1", "cogfinalimp_9522wide.dta")
+) %>%
+  dplyr::select(HHID = "hhid", PN = "pn", "cogfunction2016", "cogfunction2022")
+```
+
+# Get APOE Status
+
+```{r read_apoe}
+apoe_df <- haven::read_dta(
+  file.path(hrs_dir, "APOE", "apoe_serotonin_release.dta")
+) %>%
+  dplyr::select(HHID = "hhid", PN = "pn", APOE = "apoe") %>%
+  dplyr::mutate(
+    APOE4 = dplyr::case_when(
+      is.na(.data$APOE) ~ NA_real_,
+      .data$APOE == 44 ~ 2,
+      .data$APOE %in% c(24, 34, 42, 43) ~ 1,
+      .data$APOE %in% c(22, 23, 32, 33) ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+# Get Linkage File
+
+```{r read_linkage}
+linkage_df <- haven::read_sas(
+  file.path(hrs_dir, "Linkage-file", "niagads_id_crosswalk.sas7bdat")
+)
+```
+
+# Get Biomarkers
+
+```{r read_biomarker}
+safe_log <- function(data) {
+  dplyr::case_when(
+    is.na(data) ~ NA_real_,
+    data <= 0 ~ NA_real_,
+    TRUE ~ log(data)
+  )
+}
+
+bio_df <- haven::read_sas(
+  file.path(hrs_dir, "biomarkers", "HCAPbioPilot", "hcapbiopilota_r.sas7bdat")
+) %>%
+  dplyr::select(
+    "HHID",
+    "PN",
+    "PAB42_40_RATIO",
+    "PPTAU181",
+    "PGFAP",
+    "PNFL"
+  ) %>%
+  dplyr::mutate(
+    LOG_AB42_40_RATIO = safe_log(.data$PAB42_40_RATIO),
+    LOG_PTAU181 = safe_log(.data$PPTAU181),
+    LOG_GFAP = safe_log(.data$PGFAP),
+    LOG_NFL = safe_log(.data$PNFL)
+  )
+```
+
+# Merge
+
+```{r merge}
+# Join two tables that each have one row per HHID/PN
+join_by_subject <- function(x, y, join = dplyr::left_join) {
+  join(
+    x,
+    y,
+    by = c("HHID", "PN"),
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+}
+
+merge_df <- pheno_df %>%
+  join_by_subject(dem_df) %>%
+  join_by_subject(apoe_df) %>%
+  join_by_subject(linkage_df) %>%
+  join_by_subject(bio_df)
+```
+
+# Save Results
+
+```{r save}
+write.csv(
+  merge_df,
+  file = file.path(data_dir, "phenotype.csv"),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

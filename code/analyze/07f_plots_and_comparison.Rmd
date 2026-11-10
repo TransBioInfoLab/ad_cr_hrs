@@ -1,0 +1,361 @@
+---
+title: "ADNI Plots and Comparison Tables by MRS"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    # Default printing keeps model and test tables in their R print format
+    df_print: default
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 200)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(lmerTest)
+  library(emmeans)
+  library(ggplot2)
+  library(knitr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"), path = getwd()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+code_dir <- file.path(analysis_dir, "code", "R")
+save_dir <- file.path(analysis_dir, "analysis-results", "ADNI")
+plot_dir <- file.path(analysis_dir, "analysis-results", "plots")
+```
+
+<style>
+pre, pre code {
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+pre { overflow-x: auto; }
+</style>
+
+# Define Functions
+
+Most functions live in source files under `code_dir`, grouped by role. None of
+them read objects from the global environment; everything a function needs is
+passed in as an argument.
+
+| File | Contents |
+|---|---|
+| `plot_functions.R` | Spaghetti and scatter plots, panel labels, captions, colors, and PDF saving |
+| `table_functions.R` | P-value and summary formatting, Spearman correlations, and the Low-vs-High comparison tables |
+| `prediction_functions.R` | Reference values for covariates and the adjusted (emmeans) predictions |
+
+## Source Files
+
+```{r source_functions}
+source(file.path(code_dir, "plot_functions.R"))
+source(file.path(code_dir, "table_functions.R"))
+source(file.path(code_dir, "prediction_functions.R"))
+```
+
+## Participant Data and Checks
+
+These stay in this file because they are short and guard the data used below.
+
+```{r func_participants}
+# One row per participant: the earliest modeled visit.
+get_baseline_rows <- function(model_df) {
+  model_df %>%
+    dplyr::arrange(.data$RID, .data$time) %>%
+    dplyr::distinct(.data$RID, .keep_all = TRUE)
+}
+
+check_finite_mrs <- function(participants) {
+  if (any(!is.finite(participants$mrs_z))) {
+    stop("MRS comparisons require a finite mrs_z for each model participant.")
+  }
+}
+
+# Do not silently plot a simplified model if fixed-effect columns were dropped.
+check_models_estimable <- function(models) {
+  for (group_name in names(models)) {
+    if (anyNA(lme4::fixef(models[[group_name]], add.dropped = TRUE))) {
+      stop(
+        group_name, ": the Reduced Model has non-estimable fixed effects. ",
+        "Inspect the subgroup covariate variation before making predictions."
+      )
+    }
+  }
+}
+```
+
+# Load Data
+
+```{r load_results}
+prep_ls <- readRDS(file.path(save_dir, "ADNI_Split.rds"))
+mrs_model_df <- prep_ls$mrs_model_df
+mrs_participants <- prep_ls$mrs_participants
+mrs_median <- prep_ls$mrs_median
+mrs_levels <- prep_ls$mrs_levels
+mrs_datasets <- prep_ls$mrs_datasets
+mrs_group_summary <- prep_ls$mrs_group_summary
+
+model_ls <- readRDS(file.path(save_dir, "ADNI_Models.rds"))
+sf_low <- model_ls$sf_low
+sf_high <- model_ls$sf_high
+```
+
+The group summary below (from file 1) shows the observed predictor range in
+each MRS group; it is the predictor-range table referred to in the plotting
+sections.
+
+```{r show_group_summary}
+knitr::kable(
+  mrs_group_summary, digits = 3,
+  caption = "Participants, usable visits, and predictor ranges in each MRS dataset"
+)
+```
+
+# Spaghetti Plot for the Two MRS Groups
+
+Gray lines and points show observed participant memory trajectories.
+Colored lines show adjusted mean trajectories from each MRS dataset's own
+Reduced Model at the pooled participant-level **25th, 50th, and 75th
+percentiles of baseline pTau**. These common display values are on the
+original pTau scale. If quantiles coincide, identical curves are shown once.
+Shading shows pointwise 95% confidence intervals for the adjusted mean.
+
+For predictions, continuous MRS is held at the participant-level median
+**within that MRS group**. Both panels use the same reference values for
+age, sex, APOE4, and education. Each panel's fitted curves stop at its maximum
+observed follow-up. The predictor-range table above and the warning below
+identify any pTau display values outside a group's observed range.
+
+## Reference Values
+
+```{r reference_values}
+reduced_models <- setNames(list(sf_low, sf_high), mrs_levels)
+check_models_estimable(reduced_models)
+
+reference_values <- get_reference_values(mrs_participants, mrs_datasets)
+ptau_display <- get_ptau_display_values(mrs_participants)
+
+knitr::kable(
+  make_ptau_quantile_table(ptau_display),
+  digits = 4,
+  caption = "Common baseline pTau values used for adjusted trajectories"
+)
+```
+
+## Predictions
+
+```{r predictions}
+memory_predictions <- make_memory_predictions(
+  reduced_models, mrs_datasets, reference_values, ptau_display, mrs_levels
+)
+```
+
+## Plot Inputs
+
+```{r plot_inputs}
+spaghetti_panel_labels <- make_spaghetti_panel_labels(
+  mrs_group_summary, mrs_levels
+)
+memory_predictions <- add_panel_column(
+  memory_predictions, spaghetti_panel_labels
+)
+observed_plot_df <- mrs_model_df %>%
+  add_panel_column(spaghetti_panel_labels) %>%
+  dplyr::arrange(.data$RID, .data$time)
+
+ptau_colors <- get_ptau_colors(ptau_display$labels)
+plot_caption <- make_spaghetti_caption(reference_values)
+```
+
+## Plot
+
+```{r spaghetti_by_mrs_group, fig.width=14, fig.height=8}
+spaghetti_memory <- make_spaghetti_memory_plot(
+  observed_plot_df, memory_predictions, ptau_colors, plot_caption
+)
+spaghetti_memory
+```
+
+## Save Spaghetti Plots as PDF Files
+
+The combined two-panel figure and separate Low MRS and High MRS figures
+are saved in `plot_dir` when this chunk runs. All three retain the
+adjusted trajectories from the subgroup Reduced Models. The separate
+figures use common x- and y-axis limits for comparison.
+The combined figure is 14 x 8 inches; each separate figure is 10 x 8 inches.
+Larger margins and additional spacing separate the panels, labels, legend,
+and caption in both the HTML output and the PDFs.
+
+```{r save_spaghetti_pdfs}
+spaghetti_pdf_paths <- c(
+  Combined = file.path(plot_dir, "ADNI_spaghetti_memory_low_high_MRS.pdf"),
+  `Low MRS` = file.path(plot_dir, "ADNI_spaghetti_memory_low_MRS.pdf"),
+  `High MRS` = file.path(plot_dir, "ADNI_spaghetti_memory_high_MRS.pdf")
+)
+
+ggplot2::ggsave(
+  filename = spaghetti_pdf_paths[["Combined"]],
+  plot = spaghetti_memory,
+  device = grDevices::pdf,
+  useDingbats = FALSE,
+  width = 14,
+  height = 8,
+  units = "in"
+)
+
+axis_limits <- get_shared_axis_limits(observed_plot_df, memory_predictions)
+single_panel_caption <- wrap_caption(plot_caption, width = 85)
+
+for (group_name in mrs_levels) {
+  group_spaghetti <- make_group_spaghetti_plot(
+    group_name, observed_plot_df, memory_predictions,
+    ptau_colors, single_panel_caption, axis_limits
+  )
+
+  ggplot2::ggsave(
+    filename = spaghetti_pdf_paths[[group_name]],
+    plot = group_spaghetti,
+    device = grDevices::pdf,
+    useDingbats = FALSE,
+    width = 10,
+    height = 8,
+    units = "in"
+  )
+}
+```
+
+# Scatter Plots of MRS and Baseline pTau
+
+Each point represents one modeled participant. Spearman correlations are
+computed separately in the high and low MRS datasets. The
+trend line is an unadjusted ordinary least-squares line with a 95% confidence
+band. The correlation and trend line describe association within each
+group's restricted MRS range.
+
+The two panels share the y-axis. Each panel's x-axis ends at the MRS cutoff (the
+median): the Low MRS panel stops at the cutoff and the High MRS panel starts
+there. This removes the empty region that would otherwise separate the panels,
+which exists only because the groups are defined by that cutoff.
+
+## Spearman Correlations
+
+```{r mrs_ptau_spearman}
+scatter_participants <- get_baseline_rows(mrs_model_df)
+spearman_results <- compute_spearman_by_group(scatter_participants, mrs_levels)
+
+knitr::kable(
+  format_spearman_table(spearman_results),
+  caption = "Participant-level Spearman correlation of MRS with baseline pTau"
+)
+```
+
+## Plot
+
+```{r scatter_inputs}
+scatter_panel_labels <- make_scatter_panel_labels(mrs_group_summary, mrs_levels)
+scatter_plot_df <- add_panel_column(scatter_participants, scatter_panel_labels)
+spearman_plot_labels <- add_panel_column(spearman_results, scatter_panel_labels)
+```
+
+```{r scatter_mrs_baseline_ptau, fig.width=12, fig.height=5.5}
+scatter_mrs_ptau <- make_mrs_ptau_scatter_plot(
+  scatter_plot_df, spearman_plot_labels, make_scatter_caption(),
+  mrs_cutoff = mrs_median, mrs_levels = mrs_levels
+)
+scatter_mrs_ptau
+```
+
+# Comparison by MRS
+
+These comparisons use the **same Low MRS and High MRS median split**
+as the two mixed models. Baseline characteristics are counted once per
+participant; follow-up summaries use the observations included in the models.
+Continuous characteristics are compared with a two-group Kruskal-Wallis
+test, and categorical characteristics with Fisher's exact test.
+
+```{r comparison_by_mrs_setup}
+mrs_comparison_participants <- get_baseline_rows(mrs_model_df)
+check_finite_mrs(mrs_comparison_participants)
+```
+
+## Follow-up and visits
+
+```{r comparison_by_mrs_followup}
+mrs_followup <- summarize_followup(mrs_model_df)
+mrs_followup_table <- summarize_mrs_continuous(
+  mrs_followup,
+  c(followup_years = "Follow-up from baseline (years)",
+    n_visits = "Number of modeled visit times"),
+  mrs_levels
+)
+knitr::kable(
+  mrs_followup_table,
+  caption = "Follow-up by low/high MRS group: participant N and mean ± SD (median)."
+)
+```
+
+## Continuous baseline characteristics
+
+```{r comparison_by_mrs_continuous}
+mrs_baseline_table <- summarize_mrs_continuous(
+  mrs_comparison_participants,
+  c(baseline_age = "Baseline age (years)",
+    PHC_Education = "Education (years)",
+    baseline_pTau = "Baseline pTau"),
+  mrs_levels
+)
+knitr::kable(
+  mrs_baseline_table,
+  caption = "Baseline characteristics by low/high MRS group: participant N and mean ± SD (median)."
+)
+```
+
+## Categorical baseline characteristics
+
+```{r comparison_by_mrs_categorical}
+mrs_categorical_table <- summarize_mrs_categorical(
+  mrs_comparison_participants,
+  c(PHC_Sex = "Sex", APOE4 = "APOE ε4 allele count"),
+  mrs_levels
+)
+knitr::kable(
+  mrs_categorical_table,
+  caption = paste0(
+    "Categorical baseline characteristics by low/high MRS group: n (% within group). ",
+    "Total N and group N are nonmissing participant denominators; ",
+    "Fisher P compares the two MRS groups and is repeated for each level."
+  )
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

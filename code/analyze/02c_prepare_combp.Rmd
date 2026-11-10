@@ -1,0 +1,156 @@
+---
+title: "Prepare significance results for input into Comb-p"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data", "combp")
+smoking_dir <- file.path(analysis_dir, "data", "combp_smoking")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results", "linear_model")
+```
+
+# Define Functions
+
+## Get Combp Data
+
+```{r func_count}
+# prefix is "" for the primary analysis and "Smoking_Adjusted_" for the
+# smoking-adjusted sensitivity analysis (both BACON-corrected in 02b)
+get_interaction_results <- function(parameter, prefix = "") {
+  save_name <- paste0(prefix, "EAP_stats_bacon_", parameter, ".csv")
+
+  stats_df <- read.csv(file.path(save_dir, save_name)) %>%
+    dplyr::select(
+      probe = "CpG",
+      chrom = "Chr",
+      start = "Position",
+      end = "Position",
+      "pvalue_bacon"
+    ) %>%
+    dplyr::mutate(start = .data$start - 1)
+
+  colnames(stats_df) <- c("probe", "chrom", "start", "end", parameter)
+
+  stats_df
+}
+
+save_results <- function(stats_df, out_dir) {
+  write.table(
+    stats_df,
+    file = file.path(out_dir, "combp_input.bed"),
+    row.names = FALSE,
+    col.names = TRUE,
+    quote = FALSE,
+    sep = "\t"
+  )
+}
+
+# extra_args adds options for the smoking-adjusted run
+# ("--region-filter-p 1.0" keeps all regions, so that each primary DMR can be
+# matched to its overlapping smoking-adjusted region in 03b)
+get_category_command <- function(parameter, extra_args = "") {
+  # Column of combp_input.bed holding this parameter's P-values
+  p_col <- if (parameter == "ptau") 4 else 5
+
+  paste0(
+    "comb-p pipeline --seed 0.05",
+    extra_args,
+    " -p ", parameter,
+    " -c ", p_col, " --dist 750 combp_input.bed"
+  )
+}
+
+get_commands <- function(extra_args = "") {
+  commands <- c(
+    "#!/bin/bash",
+    "",
+    get_category_command("ptau", extra_args),
+    get_category_command("interact", extra_args)
+  )
+
+  commands
+}
+
+get_combp_stats <- function(prefix = "") {
+  ptau_df <- get_interaction_results("ptau", prefix)
+  interact_df <- get_interaction_results("interact", prefix)
+
+  interact_df <- interact_df[match(ptau_df$probe, interact_df$probe), ]
+  ptau_df$interact <- interact_df$interact
+  stats_df <- ptau_df %>%
+    dplyr::select("chrom", "start", "end", "ptau", "interact", "probe") %>%
+    dplyr::filter(!(.data$chrom %in% c("chrX", "chrY"))) %>%
+    dplyr::arrange(.data$chrom, .data$start)
+
+  stats_df
+}
+
+# Primary analysis: inputs and commands in data/combp/
+# Smoking_Adjusted: inputs and commands in data/combp_smoking/
+compile_combp_data <- function(prefix = "", out_dir = data_dir, extra_args = "") {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  stats_df <- get_combp_stats(prefix)
+  save_results(stats_df, out_dir)
+
+  writeLines(get_commands(extra_args), file.path(out_dir, "combp_commands.sh"))
+}
+```
+
+# Create Commands
+
+```{r run}
+compile_combp_data()
+```
+
+# Create Commands, Smoking Adjusted
+
+```{r run_smoking}
+compile_combp_data(
+  prefix = "Smoking_Adjusted_",
+  out_dir = smoking_dir,
+  extra_args = " --region-filter-p 1.0"
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

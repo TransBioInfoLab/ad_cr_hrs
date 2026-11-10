@@ -1,0 +1,126 @@
+---
+title: "Prepare comb-p region_p retests of the significant DMRs"
+subtitle: "Primary and Smoking_Adjusted P-values on the same DMR boundaries"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+combp_dir <- file.path(analysis_dir, "data", "combp")
+smoking_dir <- file.path(analysis_dir, "data", "combp_smoking")
+region_dir <- file.path(analysis_dir, "data", "combp_region")
+save_dir <- file.path(analysis_dir, "analysis-results")
+```
+
+# Define Functions
+
+```{r func}
+get_significant_dmrs <- function() {
+  read.csv(file.path(save_dir, "comb-p-DMRs", "interact_DMRs.csv")) %>%
+    tidyr::separate_wider_delim(
+      cols = "DMR", delim = ":", names = c("chrom", "pos")
+    ) %>%
+    tidyr::separate_wider_delim(
+      cols = "pos", delim = "-", names = c("start", "end")
+    ) %>%
+    dplyr::select("chrom", "start", "end") %>%
+    dplyr::mutate(
+      start = as.integer(.data$start),
+      end = as.integer(.data$end)
+    ) %>%
+    dplyr::arrange(.data$chrom, .data$start)
+}
+
+get_region_commands <- function() {
+  c(
+    "#!/bin/bash",
+    "",
+    "set -euo pipefail",
+    "",
+    paste0(
+      "comb-p region_p",
+      " -p combp_input.bed",
+      " -r interact_dmrs.bed",
+      " -s 50",
+      " -c 5",
+      " > interact_dmrs_retested.bed"
+    )
+  )
+}
+
+# input_dir holds the 02c comb-p input for this analysis
+prepare_region_run <- function(label, input_dir, dmr_df) {
+  out_dir <- file.path(region_dir, label)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # same per-CpG input as the 02c discovery run (column 5 = interaction P)
+  stopifnot(file.copy(
+    file.path(input_dir, "combp_input.bed"),
+    file.path(out_dir, "combp_input.bed"),
+    overwrite = TRUE
+  ))
+
+  write.table(
+    dmr_df,
+    file = file.path(out_dir, "interact_dmrs.bed"),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = c("#chrom", "start", "end")
+  )
+
+  writeLines(get_region_commands(), file.path(out_dir, "combp_commands.sh"))
+}
+```
+
+# Create Inputs and Commands
+
+```{r run}
+dmr_df <- get_significant_dmrs()
+cat("Significant DMRs to retest:", nrow(dmr_df), "\n")
+
+prepare_region_run("Primary", combp_dir, dmr_df)
+prepare_region_run("Smoking_Adjusted", smoking_dir, dmr_df)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

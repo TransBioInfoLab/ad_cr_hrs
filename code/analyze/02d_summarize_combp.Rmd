@@ -1,0 +1,382 @@
+---
+title: "Add probes to comb-p results"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(readr)
+  library(IRanges)
+  library(GenomicRanges)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data", "combp")
+smoking_dir <- file.path(analysis_dir, "data", "combp_smoking")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "annotation_functions.R"))
+```
+
+# Define Functions
+
+## Get Combp Data
+
+```{r func_load}
+# prefix is "" for the primary analysis and "Smoking_Adjusted_" for the
+# smoking-adjusted analysis (both BACON-corrected in 02b)
+get_bacon_stats_path <- function(label, prefix = "") {
+  file.path(
+    save_dir,
+    "linear_model",
+    paste0(prefix, "EAP_stats_bacon_", label, ".csv")
+  )
+}
+
+# combp_dir is data/combp/ for the primary analysis and
+# data/combp_smoking/ for the smoking-adjusted analysis (see 02c)
+get_combp_inputs <- function(combp_dir = data_dir) {
+  fname <- file.path(combp_dir, "combp_input.bed")
+
+  combp_df <- read.table(fname, header = TRUE, sep = "\t") %>%
+    dplyr::select("probe", chr = "chrom", "start", "end")
+
+  combp_df
+}
+
+get_combp_result <- function(label, combp_dir = data_dir) {
+  fname <- file.path(
+    combp_dir, paste0(label, ".regions-t.bed")
+  )
+
+  combp_df <- readr::read_table(fname) %>%
+    dplyr::rename(chr = "#chrom") %>%
+    as.data.frame() %>%
+    dplyr::mutate(
+      DMR = paste0(.data$chr, ":", .data$start, "-", .data$end)
+    )
+
+  combp_df
+}
+
+get_probe_annotations <- function(label, prefix = "") {
+  res_df <- read.csv(get_bacon_stats_path(label, prefix)) %>%
+    dplyr::mutate(
+      direction = ifelse(.data$estimate_bacon > 0, "+", "-")
+    ) %>%
+    dplyr::select(
+      probe = "CpG",
+      "direction",
+      "UCSC_RefGene_Group",
+      "UCSC_RefGene_Name",
+      "Relation_to_Island"
+    )
+
+  res_df
+}
+```
+
+## Get Signif Data
+
+```{r func_signif}
+get_signif_dmr <- function(label) {
+  dmr_ls <- read.csv(
+    file.path(save_dir, "comb-p-DMRs", paste0(label, "_DMRs.csv"))
+  ) %>%
+    dplyr::pull("cpgs_in_region") %>%
+    stringr::str_split(",") %>%
+    unlist() %>%
+    unique()
+
+  dmr_ls
+}
+
+get_signif_cpgs <- function(label) {
+  cpg_ls <- read.csv(get_bacon_stats_path(label)) %>%
+    dplyr::filter(
+      .data$pvalue_bacon < 1e-5,
+      .data$IQR >= 2
+    ) %>%
+    dplyr::pull("CpG")
+
+  cpg_ls
+}
+```
+
+## Get GREAT Annotation
+
+```{r func_great}
+make_dmr_granges <- function(dmr_df) {
+  dmr_df %>%
+    GenomicRanges::makeGRangesFromDataFrame(
+      start.field = "start",
+      end.field = "end",
+      seqnames.field = "chr"
+    )
+}
+
+# "GENE (+distance)" for each gene associated with one region, joined by ";"
+format_great_genes <- function(genes, dist_to_tss) {
+  g <- ifelse(
+    dist_to_tss > 0,
+    paste0(genes, " (+", dist_to_tss, ")"),
+    paste0(genes, " (", dist_to_tss, ")")
+  )
+
+  paste0(g, collapse = ";")
+}
+
+# Add the GREAT region-gene associations to dmr_df as GREAT_annotation
+add_great_annotation <- function(dmr_df, region_genes_df) {
+  great_annotation <- lapply(
+    seq_along(region_genes_df$annotated_genes),
+    function(i) {
+      format_great_genes(
+        region_genes_df$annotated_genes[[i]],
+        region_genes_df$dist_to_TSS[[i]]
+      )
+    }
+  )
+
+  great_df <- region_genes_df %>%
+    dplyr::select("seqnames", "start", "end") %>%
+    dplyr::mutate(GREAT_annotation = unlist(great_annotation))
+
+  dmr_df %>%
+    dplyr::left_join(great_df, by = c("chr" = "seqnames", "start", "end"))
+}
+
+get_great_annot_local <- function(dmr_df) {
+  region_genes_df <- rGREAT::great(
+    gr = make_dmr_granges(dmr_df),
+    gene_sets = "GO:BP",
+    tss_source = "GREAT:hg38"
+  ) %>%
+    rGREAT::getRegionGeneAssociations(by_middle_points = TRUE) %>%
+    as.data.frame()
+
+  add_great_annotation(dmr_df, region_genes_df)
+}
+
+# Same annotation using the online GREAT server
+get_great_annot <- function(dmr_df) {
+  region_genes_df <- make_dmr_granges(dmr_df) %>%
+    rGREAT::submitGreatJob(genome = "hg38") %>%
+    rGREAT::getRegionGeneAssociations() %>%
+    as.data.frame()
+
+  add_great_annotation(dmr_df, region_genes_df)
+}
+```
+
+## Merge Data
+
+```{r func_merge}
+add_probes <- function(input_df, result_df, annot_df) {
+  input_gr <- input_df %>%
+    GenomicRanges::makeGRangesFromDataFrame()
+
+  result_gr <- result_df %>%
+    GenomicRanges::makeGRangesFromDataFrame()
+
+  overlap_df <- GenomicRanges::findOverlaps(result_gr, input_gr) %>%
+    as.data.frame()
+
+  cpg_df <- input_df %>%
+    dplyr::mutate(index = dplyr::row_number()) %>%
+    dplyr::select("probe", "index") %>%
+    dplyr::inner_join(overlap_df, by = c("index" = "subjectHits")) %>%
+    dplyr::left_join(annot_df, by = "probe") %>%
+    dplyr::group_by(.data$queryHits) %>%
+    dplyr::summarise(
+      direction = paste0(.data$direction, collapse = ""),
+      cpgs_in_region = paste0(.data$probe, collapse = ","),
+      UCSC_RefGene_Group = filter_collapse(.data$UCSC_RefGene_Group, collapse = ";"),
+      UCSC_RefGene_Name = filter_collapse(.data$UCSC_RefGene_Name, collapse = ";"),
+      Relation_to_Island = filter_collapse(.data$Relation_to_Island, collapse = ";")
+    ) %>%
+    dplyr::ungroup()
+
+  result_df <- result_df %>%
+    dplyr::mutate(index = dplyr::row_number()) %>%
+    dplyr::left_join(cpg_df, by = c("index" = "queryHits")) %>%
+    dplyr::select(-"index") %>%
+    dplyr::select(
+      "DMR",
+      "n_probes",
+      `P-value` = "z_p",
+      `Sidak-P` = "z_sidak_p",
+      "direction",
+      "cpgs_in_region",
+      "UCSC_RefGene_Group",
+      "UCSC_RefGene_Name",
+      "Relation_to_Island",
+      "GREAT_annotation"
+    )
+
+  result_df
+}
+```
+
+## Wrapper Functions
+
+```{r func_wrapper}
+# The primary analysis keeps only significant DMRs. The smoking-adjusted
+# analysis (filter_dmrs = FALSE) keeps every region, so that each primary DMR
+# can be matched to its overlapping smoking-adjusted region in 03b.
+combp_wrapper <- function(
+    label, prefix = "", combp_dir = data_dir, filter_dmrs = TRUE
+) {
+  input_df <- get_combp_inputs(combp_dir)
+  # Stanford's Great host was down. Running GREAT annotation locally
+  result_df <- get_combp_result(label, combp_dir) %>%
+    get_great_annot_local()
+  annot_df <- get_probe_annotations(label, prefix)
+  dmr_df <- add_probes(input_df, result_df, annot_df)
+
+  if (!filter_dmrs) {
+    write.csv(
+      dmr_df,
+      file = file.path(
+        save_dir, "comb-p-DMRs", paste0(prefix, label, "_DMRs.csv")
+      ),
+      row.names = FALSE
+    )
+    return(invisible(dmr_df))
+  }
+
+  dmr_df <- dmr_df %>%
+    dplyr::filter(.data$n_probes >= 3) %>%
+    dplyr::filter(.data$`Sidak-P` < 0.05) %>%
+    dplyr::mutate(
+      uni_dir = sapply(
+        .data$direction, function(x) {
+          paste0(unique(stringr::str_split(x, "")[[1]]), collapse = "")
+        }
+      )
+    ) %>%
+    dplyr::filter(nchar(.data$uni_dir) == 1) %>%
+    dplyr::select(-"uni_dir")
+
+  write.csv(
+    dmr_df,
+    file = file.path(save_dir, "comb-p-DMRs", paste0(label, "_DMRs.csv")),
+    row.names = FALSE
+  )
+}
+
+signif_wrapper <- function(label) {
+  dmr_ls <- get_signif_dmr(label)
+  cpg_ls <- get_signif_cpgs(label)
+
+  both_ls <- intersect(dmr_ls, cpg_ls)
+
+  signif_df <- rbind(
+    data.frame(
+      cpgs = dmr_ls[!(dmr_ls %in% both_ls)],
+      Sources = "CpG in DMR"
+    ),
+    data.frame(
+      cpgs = cpg_ls[!(cpg_ls %in% both_ls)],
+      Sources = "individual CpG"
+    )
+  )
+
+  if (length(both_ls) > 0) {
+    signif_df <- rbind(
+      data.frame(
+        cpgs = both_ls,
+        Sources = "DMR and Individual CpG"
+      ),
+      signif_df
+    )
+  }
+
+  write.csv(
+    signif_df,
+    file.path(save_dir, "comb-p-DMRs", paste0(label, "_mQTLs_inputs.csv")),
+    row.names = FALSE
+  )
+}
+```
+
+# Add Probes to DMRs
+
+```{r run_wrapper}
+for (label in c("interact", "ptau")) {
+  combp_wrapper(label)
+  combp_wrapper(
+    label,
+    prefix = "Smoking_Adjusted_",
+    combp_dir = smoking_dir,
+    filter_dmrs = FALSE
+  )
+}
+```
+
+# Get Signif Probes
+
+```{r run_signif}
+signif_wrapper("interact")
+signif_wrapper("ptau")
+```
+
+# Merge Comb-p to CpG Statistics
+
+```{r run_merge}
+dmr_df <- read.csv(
+  file.path(save_dir, "comb-p-DMRs", "interact_DMRs.csv")
+) %>%
+  dplyr::select("DMR", "P.value", "Sidak.P", CpG = "cpgs_in_region") %>%
+  tidyr::separate_longer_delim("CpG", delim = ",")
+cpg_df <- read.csv(get_bacon_stats_path("interact"))
+
+res_df <- dmr_df %>%
+  dplyr::left_join(cpg_df, by = "CpG")
+
+write.csv(
+  res_df,
+  file = file.path(save_dir, "comb-p-DMRs", "interact_DMR_CpG_Mapping.csv"),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

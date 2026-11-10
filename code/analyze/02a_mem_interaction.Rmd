@@ -1,0 +1,458 @@
+---
+title: "Epigenome-wide interaction analysis testing association between pTau 181 and memory variation with methylation"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(SummarizedExperiment)
+  library(parallel)
+  library(doParallel)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION", "data")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "parallel_functions.R"))
+```
+
+# Define Functions
+
+## Get Residuals
+
+```{r func_resid}
+run_resid_test <- function(pheno_df, fo) {
+  formula <- as.formula(fo)
+  lm_mod <- stats::lm(formula, data = pheno_df, na.action = na.exclude)
+  resids <- stats::residuals(lm_mod)
+
+  resids
+}
+
+calculate_residuals <- function(pheno_df) {
+  fo <- paste(
+    c(
+      "VS4MEM_EAP ~ ",
+      "Age",
+      "Gender",
+      "APOE4",
+      "prop_B",
+      "prop_NK",
+      "prop_CD4",
+      "prop_MO",
+      "prop_GR"
+    ),
+    collapse = " + "
+  )
+
+  resid_vals <- run_resid_test(pheno_df, fo)
+
+  pheno_df$resid <- resid_vals
+
+  # Smoking_Adjusted sensitivity analysis: also adjust the memory residual
+  # for the DNAm-based SSc smoking score (computed in 01d)
+  fo <- paste0(fo, " + Smoking_Score")
+  resid_vals <- run_resid_test(pheno_df, fo)
+  pheno_df$resid_smoke <- resid_vals
+
+  pheno_df
+}
+
+add_residuals <- function(pheno_df) {
+  pheno_df <- pheno_df %>%
+    dplyr::mutate(
+      dplyr::across(
+        c(
+          "VS4MEM_EAP",
+          "Age",
+          "APOE4",
+          "prop_B",
+          "prop_NK",
+          "prop_CD4",
+          "prop_CD8",
+          "prop_MO",
+          "prop_GR",
+          "Smoking_Score"
+        ),
+        as.numeric
+      ),
+      Gender = as.character(.data$Gender)
+    )
+
+  # The smoking-adjusted analysis must use the same participants
+  stopifnot(!anyNA(pheno_df$Smoking_Score))
+
+  pheno_df <- calculate_residuals(pheno_df)
+
+  pheno_df
+}
+```
+
+## Load Data
+
+```{r func_load}
+filter_probes <- function(dnam_data) {
+  row_df <- dnam_data %>%
+    SummarizedExperiment::rowData() %>%
+    as.data.frame() %>%
+    dplyr::filter(!.data$filter_snp)
+
+  dnam_data[row_df %>% dplyr::pull("Name"), ]
+}
+
+get_dnam_data <- function(pheno_df) {
+  dnam_data <- readRDS(
+    file.path(hrs_dir, "batch_corrected", "HRS_White_NHispanic_PCA.RDS")
+  )
+  dnam_data <- dnam_data[
+    , dnam_data$SubjectID_Submitter %in% pheno_df$SubjectID_Submitter
+  ]
+  dnam_data <- filter_probes(dnam_data)
+
+  dnam_data
+}
+
+get_study_data <- function() {
+  pheno_df <- read.csv(file.path(data_dir, "NHW_HCAP_MCI.csv")) %>%
+    dplyr::filter(
+      !is.na(.data$APOE4),
+      !is.na(.data$Gender),
+      !is.na(.data$Age),
+      !is.na(.data$VS4MEM_EAP),
+      !is.na(.data$Z_PTAU181)
+    ) %>%
+    add_residuals()
+  dnam_data <- get_dnam_data(pheno_df)
+  pheno_df <- pheno_df[
+    match(dnam_data$SubjectID_Submitter, pheno_df$SubjectID_Submitter),
+  ]
+  beta <- SummarizedExperiment::assays(dnam_data)$dnam
+  row_df <- dnam_data %>%
+    SummarizedExperiment::rowData() %>%
+    as.data.frame()
+  row.names(pheno_df) <- colnames(beta)
+
+  dnam_data <- SummarizedExperiment::SummarizedExperiment(
+    assays = list(dnam = beta),
+    colData = pheno_df,
+    rowData = row_df
+  )
+
+  dnam_data
+}
+```
+
+## Annotations
+
+```{r func_annot}
+get_nasser_data <- function() {
+  celltypes <- readxl::read_xlsx(
+    file.path(reference_dir, "Nassser study selected biosamples.xlsx"),
+    col_names = FALSE
+  ) %>%
+    dplyr::pull(1)
+  df <- readr::read_tsv(
+    file.path(
+      reference_dir,
+      "AllPredictions.AvgHiC.ABC0.015.minus150.ForABCPaperV3.txt.gz"
+    )
+  ) %>%
+    dplyr::filter(.data$CellType %in% celltypes) %>%
+    dplyr::filter(!.data$isSelfPromoter) %>%
+    dplyr::filter(.data$class != "promoter") %>%
+    dplyr::select(
+      seqnames = "chr",
+      "start",
+      "end",
+      celltype = "CellType"
+    ) %>%
+    dplyr::distinct()
+
+  df
+}
+
+get_hg19_positions <- function() {
+  anno_df <- utils::data(
+    "IlluminaHumanMethylationEPICanno.ilm10b4.hg19",
+    package = "IlluminaHumanMethylationEPICanno.ilm10b4.hg19"
+  ) %>%
+    minfi::getAnnotation() %>%
+    as.data.frame() %>%
+    dplyr::select(
+      CpG = "Name",
+      seqnames = "chr",
+      start = "pos",
+      end = "pos"
+    )
+
+  anno_df
+}
+
+get_nasser_annotation <- function() {
+  nasser_df <- get_nasser_data() %>%
+    dplyr::mutate(
+      start = .data$start - 250,
+      end = .data$end + 250
+    )
+  anno_df <- get_hg19_positions()
+
+  nasser_gr <- nasser_df %>%
+    GenomicRanges::makeGRangesFromDataFrame()
+  anno_gr <- anno_df %>%
+    GenomicRanges::makeGRangesFromDataFrame()
+
+  hits_df <- findOverlaps(anno_gr, nasser_gr) %>%
+    as.data.frame()
+
+  anno_df <- data.frame(
+    CpG = anno_df$CpG[hits_df$queryHits],
+    CellType = nasser_df$celltype[hits_df$subjectHits]
+  ) %>%
+    dplyr::distinct() %>%
+    dplyr::group_by(.data$CpG) %>%
+    dplyr::summarise(CellType = paste0(.data$CellType, collapse = ";")) %>%
+    dplyr::ungroup()
+
+  anno_df
+}
+
+get_stored_annotations <- function(dnam_data) {
+  row_df <- dnam_data %>%
+    SummarizedExperiment::rowData() %>%
+    as.data.frame() %>%
+    dplyr::select(
+      CpG = "Name",
+      Chr = "seqnames",
+      Position = "pos",
+      "UCSC_RefGene_Name",
+      "UCSC_RefGene_Group",
+      "Relation_to_Island"
+    )
+
+  row_df
+}
+
+get_great_annotations <- function() {
+  great_df <- readRDS(file.path(reference_dir, "GREAT_EPIC_hg38.RDS")) %>%
+    dplyr::select(
+      CpG = "cpg", "GREAT_annotation"
+    )
+
+  great_df
+}
+
+get_probe_annotations <- function(dnam_data) {
+  nasser_df <- get_nasser_annotation()
+  row_df <- get_stored_annotations(dnam_data)
+  great_df <- get_great_annotations()
+
+  probe_df <- row_df %>%
+    dplyr::left_join(great_df, by = "CpG") %>%
+    dplyr::left_join(nasser_df, by = "CpG") %>%
+    dplyr::mutate(
+      nasser_is_enhancer = ifelse(is.na(.data$CellType), 0, 1)
+    ) %>%
+    tidyr::replace_na(list(CellType = "")) %>%
+    dplyr::select(
+      "CpG",
+      "Chr",
+      "Position",
+      "GREAT_annotation",
+      "UCSC_RefGene_Name",
+      "UCSC_RefGene_Group",
+      "Relation_to_Island",
+      nasser_enhancer_cell_type = "CellType",
+      "nasser_is_enhancer"
+    )
+
+  probe_df
+}
+```
+
+## Association Test
+
+```{r func_assoc}
+# Estimate, SE, t, P and z of one model term, with column names ending in
+# "_<suffix>".
+select_term_stats <- function(coef_df, term, suffix) {
+  term_df <- coef_df[
+    term, c("estimate", "std_error", "t_value", "pvalue", "zvalue")
+  ]
+  colnames(term_df) <- paste0(
+    c("estimate", "std_error", "tvalue", "pvalue", "zvalue"), "_", suffix
+  )
+
+  term_df
+}
+
+run_lm_step <- function(beta_value, pheno_df, formula) {
+  # put beta_value on a percent scale
+  beta_value <- 100 * beta_value
+
+  data <- data.frame(dnam = beta_value, pheno_df)
+  lm_mod <- stats::lm(formula, data = data)
+
+  coef_tbl <- data.frame(summary(lm_mod)$coefficients)
+  df_resid <- stats::df.residual(lm_mod)
+
+  t_vals <- coef_tbl[, "t.value"]
+  p_vals <- coef_tbl[, "Pr...t.."]
+  z_vals <- stats::qnorm(stats::pt(t_vals, df_resid))
+
+  coef_df <- janitor::clean_names(coef_tbl) %>%
+    dplyr::mutate(
+      pvalue = p_vals,
+      zvalue = z_vals,
+      df = df_resid
+    )
+
+  cbind(
+    coef_df["dnam", "df", drop = FALSE],
+    select_term_stats(coef_df, "dnam", "dnam"),
+    select_term_stats(coef_df, "Z_PTAU181", "ptau"),
+    select_term_stats(coef_df, "Z_PTAU181:dnam", "interact")
+  )
+}
+
+run_lm_test <- function(beta_vals, pheno_df, fo) {
+  parallel_res <- start_parallel(TRUE, 8)
+  do_parallel <- parallel_res$parallel
+  cluster <- parallel_res$cluster
+
+  formula <- stats::as.formula(fo)
+
+  results <- plyr::adply(
+    beta_vals,
+    .margins = 1,
+    .fun = function(beta_value) {
+      run_lm_step(beta_value, pheno_df, formula)
+    }, .parallel = do_parallel
+  )
+
+  stop_parallel(do_parallel, cluster)
+
+  results <- results %>%
+    dplyr::rename(probe = "X1") %>%
+    dplyr::mutate(
+      fdr_dnam = stats::p.adjust(.data$pvalue_dnam, method = "fdr"),
+      fdr_ptau = stats::p.adjust(.data$pvalue_ptau, method = "fdr"),
+      fdr_interact = stats::p.adjust(.data$pvalue_interact, method = "fdr")
+    )
+
+  results
+}
+```
+
+## Wrapper Function
+
+```{r func_wrapper}
+run_association <- function(dnam_data, outcome = "resid") {
+  beta_vals <- SummarizedExperiment::assays(dnam_data)$dnam
+  beta_vals <- Harman::shiftBetas(beta_vals, shiftBy = 1e-4)
+  pheno_df <- dnam_data %>%
+    SummarizedExperiment::colData() %>%
+    as.data.frame()
+
+  fo <- paste0(outcome, " ~ Z_PTAU181 + dnam + Z_PTAU181:dnam")
+
+  run_lm_test(beta_vals, pheno_df, fo)
+}
+
+get_association_statistics <- function(dnam_data, annot_df, outcome = "resid") {
+  stats_df <- run_association(dnam_data, outcome = outcome)
+  stats_df <- annot_df %>%
+    dplyr::right_join(stats_df, by = c("CpG" = "probe"))
+
+  stats_df
+}
+
+# Primary analysis is saved as EAP_stats.csv. The Smoking_Adjusted sensitivity
+# analysis (memory residual also adjusted for Smoking_Score) is saved with a
+# "Smoking_Adjusted_" prefix, so no downstream notebook picks it up by accident.
+run_model_analysis <- function(dnam_data) {
+  pheno_df <- dnam_data %>%
+    SummarizedExperiment::colData() %>%
+    as.data.frame()
+  annot_df <- get_probe_annotations(dnam_data)
+
+  save_dir <- file.path(save_dir, "linear_model")
+
+  stats_df <- get_association_statistics(dnam_data, annot_df, outcome = "resid")
+  write.csv(
+    stats_df,
+    file = file.path(save_dir, "EAP_stats.csv"),
+    row.names = FALSE
+  )
+
+  stats_df <- get_association_statistics(
+    dnam_data, annot_df, outcome = "resid_smoke"
+  )
+  write.csv(
+    stats_df,
+    file = file.path(save_dir, "Smoking_Adjusted_EAP_stats.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    pheno_df,
+    file = file.path(save_dir, "Phenotypes.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+# Run Analysis
+
+## Get Data
+
+```{r load}
+dnam_data <- get_study_data()
+```
+
+## Run for CIND Data
+
+```{r run}
+run_model_analysis(dnam_data)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

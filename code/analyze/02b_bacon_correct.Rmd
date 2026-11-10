@@ -1,0 +1,354 @@
+---
+title: "Run Bacon Correction"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(bacon)
+  library(SummarizedExperiment)
+  library(parallel)
+  library(doParallel)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION", "data")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results", "linear_model")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "parallel_functions.R"))
+```
+
+# Define Functions
+
+## Load Data
+
+```{r func_load}
+# prefix is "" for the primary analysis and "Smoking_Adjusted_" for the
+# smoking-adjusted sensitivity analysis (both written by 02a)
+get_stat_data <- function(label, prefix = "") {
+  save_name <- paste0(prefix, "EAP_stats.csv")
+
+  stats_df <- read.csv(file.path(save_dir, save_name))
+
+  # Keep the annotation columns, plus the statistics for `label`.
+  label_columns <- c("estimate", "std_error", "tvalue", "pvalue", "zvalue", "fdr")
+  columns <- colnames(stats_df)
+  meta_columns <- columns[
+    !grepl(paste0("^(", paste(label_columns, collapse = "|"), ")"), columns)
+  ]
+  select_columns <- c(meta_columns, paste(label_columns, label, sep = "_"))
+
+  stats_df <- stats_df[, select_columns]
+  colnames(stats_df) <- c(meta_columns, label_columns)
+
+  stats_df
+}
+
+get_dnam_data <- function() {
+  pheno_df <- read.csv(file.path(save_dir, "Phenotypes.csv"))
+  dnam_data <- readRDS(
+    file.path(hrs_dir, "batch_corrected", "HRS_White_NHispanic_PCA.RDS")
+  )
+  dnam_data <- dnam_data[
+    , dnam_data$SubjectID_Submitter %in% pheno_df$SubjectID_Submitter
+  ]
+
+  dnam_data
+}
+```
+
+## Get IQR
+
+```{r func_iqr}
+get_iqr <- function(dnam_data) {
+  beta_vals <- SummarizedExperiment::assays(dnam_data)$dnam
+
+  iqr_df <- data.frame(
+    CpG = row.names(beta_vals),
+    IQR = unname(apply(beta_vals * 100, MARGIN = 1, stats::IQR))
+  )
+
+  iqr_df
+}
+
+add_iqr_fdr <- function(stats_df, min_iqr = 2) {
+  stats_df$fdr_exclude_iqr_lt2 <- NA
+  stats_df$fdr_exclude_iqr_lt2_bacon <- NA
+
+  targets <- stats_df$IQR >= min_iqr
+
+  stats_df$fdr_exclude_iqr_lt2[targets] <- stats::p.adjust(
+    stats_df$pvalue[targets], method = "fdr"
+  )
+  stats_df$fdr_exclude_iqr_lt2_bacon[targets] <- stats::p.adjust(
+    stats_df$pvalue_bacon[targets], method = "fdr"
+  )
+
+  stats_df
+}
+```
+
+## Bacon Correction
+
+```{r func_bacon}
+bacon_parameter_names <- c(
+  "alpha", "beta", "lambda1", "lambda2", "tau1", "tau2", "gamma1", "gamma2"
+)
+
+# Call fun(data, alpha = ..., ..., gamma2 = ...) with the BACON prior
+# parameters taken from `params` (a list or a one-row data frame).
+call_with_bacon_params <- function(fun, data, params) {
+  do.call(fun, c(list(data), as.list(params)[bacon_parameter_names]))
+}
+
+build_bacon_priors <- function(
+    alpha, beta, lambda1, lambda2, tau1, tau2, gamma1, gamma2
+) {
+  list(
+    sigma = list(alpha = alpha, beta = beta),
+    mu = list(lambda = c(lambda1, lambda2, -lambda2), tau = c(tau1, tau2, tau2)),
+    epsilon = list(gamma = c(gamma1, gamma2, gamma2))
+  )
+}
+
+fit_bacon <- function(estimate, std_error, priors, seed) {
+  set.seed(seed)
+  bacon::bacon(
+    teststatistics = NULL,
+    effectsizes = estimate,
+    standarderrors = std_error,
+    na.exclude = TRUE,
+    priors = priors
+  )
+}
+
+# Genomic inflation factor of the z-values implied by estimate / std_error.
+get_inflation <- function(estimate, std_error, df) {
+  tvalue <- estimate / std_error
+  zvalue <- stats::qnorm(stats::pt(tvalue, df))
+  chisq <- zvalue^2
+
+  stats::median(chisq, na.rm = TRUE) / stats::qchisq(0.5, 1)
+}
+
+run_bacon_correction <- function(
+    data,
+    alpha = 1.28,
+    beta = 0.36,
+    lambda1 = 0,
+    lambda2 = 3,
+    tau1 = 1000,
+    tau2 = 100,
+    gamma1 = 99,
+    gamma2 = 0.5
+) {
+  priors <- build_bacon_priors(
+    alpha, beta, lambda1, lambda2, tau1, tau2, gamma1, gamma2
+  )
+
+  bc <- fit_bacon(data$estimate, data$std_error, priors, seed = 23)
+  data_bacon <- data %>%
+    dplyr::mutate(
+      estimate_bacon = bacon::es(bc),
+      std_error_bacon = bacon::se(bc),
+      pvalue_bacon = bacon::pval(bc)
+    ) %>%
+    dplyr::mutate(
+      fdr_bacon = stats::p.adjust(.data$pvalue_bacon, method = "fdr")
+    )
+
+  # Refit on the corrected values to check the remaining inflation and bias.
+  bc2 <- fit_bacon(
+    data_bacon$estimate_bacon, data_bacon$std_error_bacon, priors, seed = 42
+  )
+
+  inflation_effect <- c(
+    inflation_original = get_inflation(data$estimate, data$std_error, data$df),
+    inflation_bacon = as.numeric(bacon::inflation(bc)),
+    bias_bacon = as.numeric(bacon::bias(bc)),
+    inflation_correction = get_inflation(
+      data_bacon$estimate_bacon, data_bacon$std_error_bacon, data$df
+    ),
+    inflation_bacon_correction = as.numeric(bacon::inflation(bc2)),
+    bias_bacon_correction = as.numeric(bacon::bias(bc2))
+  )
+
+  list(data = data_bacon, inflation_effect = inflation_effect)
+}
+
+# One row: the prior parameters and the inflation and bias left after correction.
+evaluate_bacon_correction <- function(data, params) {
+  inflation_effect <- call_with_bacon_params(
+    run_bacon_correction, data, params
+  )$inflation_effect
+
+  data.frame(
+    as.list(params)[bacon_parameter_names],
+    inflation = inflation_effect[["inflation_correction"]],
+    inflation_bacon = inflation_effect[["inflation_bacon_correction"]],
+    bias_bacon = inflation_effect[["bias_bacon_correction"]]
+  )
+}
+```
+
+## Iterative Bacon
+
+```{r func_iter}
+get_random_parameters <- function(count = 100, seed = 12) {
+  set.seed(seed)
+  data.frame(
+    step = 1:count,
+    alpha = round(runif(count, min = 0.5, max = 2), digits = 3),
+    beta = round(runif(count, min = 0.1, max = 1), digits = 3),
+    lambda1 = round(runif(count, min = -1, max = 1), digits = 3),
+    lambda2 = round(runif(count, min = 1, max = 4), digits = 3),
+    tau1 = round(10**runif(count, min = 2, max = 4), digits = 1),
+    tau2 = runif(count, min = 0.02, max = 0.5),
+    gamma1 = round(runif(count, min = 80, max = 99), digits = 1),
+    gamma2 = runif(count, min = 0.1, max = 0.9)
+  ) %>%
+    dplyr::mutate(
+      tau2 = round(.data$tau1 * .data$tau2, digits = 1),
+      gamma2 = round((100 - .data$gamma1) * .data$gamma2, digits = 3)
+    )
+}
+
+run_bacon_iter <- function(data, random_df) {
+  parallel_res <- start_parallel(TRUE, 16)
+  do_parallel <- parallel_res$parallel
+  cluster <- parallel_res$cluster
+
+  res_df <- plyr::adply(
+    .data = random_df,
+    .margins = 1,
+    .fun = function(row) {
+      evaluate_bacon_correction(data, row)
+    }, .parallel = do_parallel
+  )
+
+  stop_parallel(do_parallel, cluster)
+
+  res_df
+}
+```
+
+## Bacon Wrapper
+
+```{r func_bacon_wrapper}
+bacon_analyze <- function(data) {
+  random_df <- get_random_parameters(count = 1024, seed = 24)
+  iter_df <- run_bacon_iter(data, random_df)
+  iter_df <- iter_df %>%
+    dplyr::mutate(
+      score1 = abs(1 - .data$inflation_bacon),
+      score2 = abs(.data$bias_bacon),
+      score = pmax(.data$score1, .data$score2)
+    ) %>%
+    dplyr::arrange(.data$score)
+
+  # Rerun the correction with the best-scoring parameters.
+  res <- call_with_bacon_params(run_bacon_correction, data, iter_df[1, ])
+  inflation_effect <- res$inflation_effect
+  data <- res$data
+
+  inflation_df <- data.frame(
+    labels = names(inflation_effect)[1:3],
+    pre_correction = as.numeric(inflation_effect)[1:3],
+    post_correction = as.numeric(inflation_effect)[4:6]
+  )
+
+  list(stats_df = data, inflation_df = inflation_df)
+}
+
+bacon_wrapper <- function(label, iqr_df, prefix = "") {
+  stats_df <- get_stat_data(label, prefix = prefix)
+
+  res_ls <- bacon_analyze(stats_df)
+  inflation_df <- res_ls$inflation_df
+  stats_df <- res_ls$stats_df
+
+  stats_df <- stats_df %>%
+    dplyr::left_join(iqr_df, by = "CpG")
+
+  stats_df <- add_iqr_fdr(stats_df, min_iqr = 2)
+
+  save_name <- paste0(prefix, "EAP_stats_bacon_", label, ".csv")
+  inflation_name <- paste0(prefix, "EAP_inflation_", label, ".csv")
+
+  write.csv(
+    inflation_df,
+    file = file.path(save_dir, inflation_name),
+    row.names = FALSE
+  )
+
+  write.csv(
+    stats_df,
+    file = file.path(save_dir, save_name),
+    row.names = FALSE
+  )
+}
+```
+
+# Analyze
+
+## Load Data
+
+```{r load}
+dnam_data <- get_dnam_data()
+iqr_df <- get_iqr(dnam_data)
+```
+
+## Run Bacon Correction
+
+```{r bacon}
+bacon_wrapper("ptau", iqr_df)
+bacon_wrapper("interact", iqr_df)
+```
+
+## Run Bacon Correction, Smoking Adjusted
+
+```{r bacon_smoking}
+bacon_wrapper("ptau", iqr_df, prefix = "Smoking_Adjusted_")
+bacon_wrapper("interact", iqr_df, prefix = "Smoking_Adjusted_")
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

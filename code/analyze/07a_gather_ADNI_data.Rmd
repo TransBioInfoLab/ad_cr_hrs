@@ -1,0 +1,219 @@
+---
+title: "Gather ADNI Data for MRS Analysis"
+subtitle: "MCI cohort and future visits from the 2025 analysis"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(readr)
+  library(SummarizedExperiment)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+ad_dir <- file.path(base_dir, "AD_CR")
+data_dir <- file.path(ad_dir, "data", "DNAm_Aplus", "processed")
+legacy_dir <- file.path(
+  ad_dir, "analysis_results", "only_amyloid_positive_2_stage_approach"
+)
+pheno_path <- file.path(legacy_dir, "sig_probes", "Phenotypes.csv")
+legacy_mrs_path <- file.path(legacy_dir, "mrs", "MCI_MRS_scores.csv")
+cogn_path <- file.path(
+  base_dir, "DATASET", "ADNI", "Phenotype", "raw",
+  "ADSP-PHC_8-2025", "ADSP_PHC_COGN_22Aug2025.csv"
+)
+beta_path <- file.path(data_dir, "PCA.RDS")
+save_dir <- file.path(analysis_dir, "analysis-results", "ADNI")
+cohort_path <- file.path(save_dir, "ADNI_2025_MCI_future_data.rds")
+```
+
+# Load Data
+
+```{r load}
+input_paths <- c(pheno_path, legacy_mrs_path, cogn_path, beta_path)
+missing_paths <- input_paths[!file.exists(input_paths)]
+if (length(missing_paths)) {
+  stop("Required ADNI input files are missing: ", paste(missing_paths, collapse = ", "))
+}
+
+pheno_source <- readr::read_csv(pheno_path, show_col_types = FALSE)
+legacy_mrs <- readr::read_csv(legacy_mrs_path, show_col_types = FALSE)
+cogn_source <- readr::read_csv(cogn_path, show_col_types = FALSE)
+dnam_data <- readRDS(beta_path)
+beta_source <- SummarizedExperiment::assay(dnam_data, "dnam")
+```
+
+# Select the 2025 MCI Cohort
+
+## Baseline Phenotypes
+
+```{r baseline}
+# The 2025 analysis used MCI rows from Phenotypes.csv and matched MRS IDs.
+mci_df <- pheno_source %>%
+  dplyr::filter(.data$PHC_Diagnosis == 2) %>%
+  dplyr::transmute(
+    sample = as.character(.data$sample),
+    RID = .data$RID,
+    PHASE = .data$Phase,
+    dnam_date = as.Date(.data$DateDrawn),
+    baseline_age = .data$age_at_visit,
+    PHC_Age_Biomarker = .data$PHC_Age_Biomarker,
+    APOE4 = .data$APOE4,
+    Gender = .data$Gender,
+    B = .data$B,
+    Mono = .data$Mono,
+    CD4T = .data$CD4T,
+    Neutro = .data$Neutro,
+    Eosino = .data$Eosino,
+    NK = .data$NK,
+    baseline_pTau = .data$PHC_pTau,
+    raw_pTau = .data$pTau_RAW,
+    Gran = .data$Neutro + .data$Eosino
+  )
+
+if (anyNA(mci_df$sample) || anyDuplicated(mci_df$sample) ||
+    anyNA(mci_df$RID) || anyDuplicated(mci_df$RID)) {
+  stop("The legacy MCI phenotype data must have one sample and one row per RID.")
+}
+if (anyNA(legacy_mrs$sample_id) || anyDuplicated(legacy_mrs$sample_id)) {
+  stop("The legacy MRS file must have one nonmissing row per sample_id.")
+}
+
+mci_df <- mci_df %>%
+  dplyr::semi_join(
+    legacy_mrs %>% dplyr::transmute(sample = as.character(.data$sample_id)),
+    by = "sample"
+  )
+```
+
+## Future Cognition Visits
+
+```{r future_visits}
+cogn_df <- cogn_source %>%
+  dplyr::transmute(
+    RID = .data$RID,
+    PHASE = .data$PHASE,
+    EXAMDATE = as.Date(.data$EXAMDATE),
+    PHC_Education = .data$PHC_Education,
+    PHC_MEM = .data$PHC_MEM,
+    PHC_Age_Cognition = .data$PHC_Age_Cognition,
+    PHC_Diagnosis = .data$PHC_Diagnosis,
+    PHC_Sex = .data$PHC_Sex
+  )
+
+# The original join was on RID only, and excluded the MCI date itself.
+longitudinal_df <- cogn_df %>%
+  dplyr::inner_join(mci_df, by = "RID", relationship = "many-to-one") %>%
+  dplyr::filter(.data$EXAMDATE > .data$dnam_date) %>%
+  dplyr::mutate(
+    time = as.numeric(difftime(.data$EXAMDATE, .data$dnam_date, units = "days")) /
+      365.25
+  )
+
+baseline_mem <- cogn_df %>%
+  dplyr::inner_join(
+    mci_df %>% dplyr::select("RID", "dnam_date"),
+    by = "RID", relationship = "many-to-one"
+  ) %>%
+  dplyr::filter(.data$EXAMDATE == .data$dnam_date) %>%
+  dplyr::distinct(.data$RID, baseline_MEM = .data$PHC_MEM)
+
+if (anyDuplicated(baseline_mem$RID)) {
+  stop("Multiple baseline PHC_MEM values were found for a RID.")
+}
+
+longitudinal_df <- longitudinal_df %>%
+  dplyr::left_join(
+    baseline_mem,
+    by = "RID", relationship = "many-to-one"
+  )
+
+# Only people with an old MRS and at least one future visit entered the
+# 2025 model data (mrs_cogn). Keep that cohort for every new weight set.
+mci_df <- mci_df %>%
+  dplyr::semi_join(longitudinal_df %>% dplyr::distinct(.data$RID), by = "RID")
+longitudinal_df <- longitudinal_df %>%
+  dplyr::semi_join(mci_df %>% dplyr::select("sample"), by = "sample")
+
+if (!nrow(mci_df) || !nrow(longitudinal_df)) {
+  stop("No 2025 MCI samples have both an old MRS and a future cognition visit.")
+}
+```
+
+# Match DNAm to the Selected Samples
+
+```{r match_dnam}
+if (is.null(colnames(beta_source)) || anyDuplicated(colnames(beta_source))) {
+  stop("DNAm beta data must have unique sample IDs as column names.")
+}
+
+missing_samples <- setdiff(mci_df$sample, colnames(beta_source))
+if (length(missing_samples)) {
+  stop(
+    "Selected 2025 samples missing from PCA.RDS: ",
+    paste(missing_samples, collapse = ", ")
+  )
+}
+
+# 07b expects CpGs in rows and samples in columns.
+beta_data <- as.matrix(beta_source[, mci_df$sample, drop = FALSE])
+stopifnot(identical(colnames(beta_data), mci_df$sample))
+```
+
+# Save Data
+
+```{r save}
+if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+
+adni_data <- list(
+  beta_data = beta_data,
+  pheno_df = mci_df,
+  longitudinal_df = longitudinal_df
+)
+saveRDS(adni_data, cohort_path)
+
+data.frame(
+  selected_samples = nrow(mci_df),
+  selected_RIDs = dplyr::n_distinct(mci_df$RID),
+  future_visit_rows = nrow(longitudinal_df),
+  saved_to = cohort_path
+) %>% knitr::kable()
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

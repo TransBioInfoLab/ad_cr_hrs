@@ -1,0 +1,110 @@
+---
+title: "Compute MRS scores"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(readr)
+  library(SummarizedExperiment)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION", "data")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "mrs_weights.R"))
+source(file.path(code_dir, "mrs_scoring.R"))
+```
+
+# Load Data
+
+```{r load}
+# read DNAm data
+dnam_data <- readRDS(
+  file.path(hrs_dir, "batch_corrected", "HRS_White_NHispanic_PCA.RDS")
+)
+
+# Filter to samples we used for analysis
+merge_df <- read.csv(file.path(data_dir, "NHW_HCAP_MCI.csv"))
+dnam_data <- dnam_data[
+  , dnam_data$SubjectID_Submitter %in% merge_df$SubjectID_Submitter
+]
+
+# get beta values
+beta_data <- SummarizedExperiment::assays(dnam_data)$dnam
+beta_data <- beta_data[
+  , match(merge_df$SubjectID_Submitter, dnam_data$SubjectID_Submitter)
+]
+colnames(beta_data) <- merge_df$SubjectID_Submitter
+```
+
+# Analyze
+
+```{r run, fig.width = 8, fig.height = 6}
+run_mrs_analysis(
+  beta_data,
+  out_dir = file.path(save_dir, "mrs"),
+  nonfinite_message = "MRS is non-finite for one or more samples."
+)
+```
+
+# Save to Phenotype
+
+```{r save}
+mrs_df <- read.csv(file.path(save_dir, "mrs", "EAP_MRS_scores.csv"))
+pheno_df <- merge_df %>%
+  dplyr::left_join(
+    mrs_df,
+    by = c("SubjectID_Submitter" = "sample_id"),
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+
+write.csv(
+  pheno_df,
+  file = file.path(save_dir, "mrs", "pheno_data.csv"),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

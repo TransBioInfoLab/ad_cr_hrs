@@ -1,0 +1,431 @@
+---
+title: "Merge HCAP memory scores and sensitivity scores from different waves"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(haven)
+  library(dplyr)
+  library(tibble)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+hrs_dir <- file.path(base_dir, "DATASET", "HRS", "Phenotype")
+data_dir <- file.path(analysis_dir, "data")
+
+stopifnot(dir.exists(hrs_dir))
+
+if (!dir.exists(data_dir)) dir.create(data_dir, recursive = TRUE)
+```
+
+# Define Functions
+
+## Load Data
+
+```{r func_load}
+load_hcap_merge_data <- function(hrs_dir, data_dir) {
+  hsub <- haven::read_sas(
+    file.path(hrs_dir, "HCAP", "HC16summary", "hc16hp_f.sas7bdat")
+  )
+  names(hsub) <- toupper(names(hsub))
+
+  list(
+    hsub = hsub,
+    hc16 = readRDS(file.path(data_dir, "hc16_stats.RDS")),
+    hc22 = readRDS(file.path(data_dir, "hc22_stats.RDS"))
+  )
+}
+```
+
+## Prepare Wave Scores
+
+```{r func_prepare}
+assert_unique_id <- function(data, label) {
+  duplicate_ids <- data %>%
+    dplyr::count(.data$HHID, .data$PN, name = "n") %>%
+    dplyr::filter(.data$n > 1)
+
+  if (nrow(duplicate_ids) > 0) {
+    stop(label, " has duplicated HHID/PN combinations.")
+  }
+
+  invisible(data)
+}
+
+make_wave_output <- function(processed_wave, wave) {
+  processed_wave$subject_scores %>%
+    dplyr::rename(
+      SUT_MEM_COUNT = n_memory_tasks,
+      SUT_MEM_CERAD3_COUNT = n_cerad_tasks,
+      OSHEA_MEM_COUNT = n_oshea_items
+    ) %>%
+    dplyr::rename_with(
+      ~paste0(.x, "_", wave),
+      -dplyr::all_of(c("HHID", "PN"))
+    )
+}
+
+get_wave_overlap_audit <- function(hc16_scores, hc22_scores) {
+  ids16 <- hc16_scores %>% dplyr::select("HHID", "PN")
+  ids22 <- hc22_scores %>% dplyr::select("HHID", "PN")
+
+  tibble::tibble(
+    group = c("HC16", "HC22", "both waves", "HC16 only", "HC22 only"),
+    n_subjects = c(
+      nrow(ids16),
+      nrow(ids22),
+      nrow(dplyr::inner_join(ids16, ids22, by = c("HHID", "PN"))),
+      nrow(dplyr::anti_join(ids16, ids22, by = c("HHID", "PN"))),
+      nrow(dplyr::anti_join(ids22, ids16, by = c("HHID", "PN")))
+    )
+  )
+}
+
+get_hc16_classification <- function(hc16) {
+  hc16$hcap %>%
+    dplyr::transmute(
+      HHID = .data$HHID,
+      PN = .data$PN,
+      HCAP_DIAGNOSIS_EAP = .data$VS1HCAPDX_EAP,
+      MEMORY_IMPAIRMENT_EAP = .data$VS2MEMIMP_EAP
+    )
+}
+```
+
+## Merge Wave Scores
+
+```{r func_merge}
+# Join two tables that each have one row per HHID/PN
+join_by_subject <- function(x, y, join = dplyr::left_join) {
+  join(
+    x,
+    y,
+    by = c("HHID", "PN"),
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+}
+
+merge_wave_scores <- function(
+    hc16_scores, hc22_scores, hc16_classification, hsub
+) {
+  join_by_subject(hc16_scores, hc22_scores, join = dplyr::full_join) %>%
+    join_by_subject(hc16_classification) %>%
+    join_by_subject(
+      hsub %>% dplyr::select("HHID", "PN", "VS4MEM_EAP", "VS4MEM_PV")
+    ) %>%
+    dplyr::mutate(
+      SUTIN_CERAD_BOTH_WAVES = dplyr::coalesce(
+        .data$SUT_MEM_CERAD3_COUNT_16 == 3 &
+          .data$SUT_MEM_CERAD3_COUNT_22 == 3,
+        FALSE
+      ),
+      SUTIN_ALL8_BOTH_WAVES = dplyr::coalesce(
+        .data$SUT_MEM_COUNT_16 == 8 & .data$SUT_MEM_COUNT_22 == 8,
+        FALSE
+      ),
+      SUT_MEM_ALL8_BOTH_16 = dplyr::if_else(
+        .data$SUTIN_ALL8_BOTH_WAVES,
+        .data$SUT_MEM_ALL8_16,
+        NA_real_
+      ),
+      SUT_MEM_ALL8_BOTH_22 = dplyr::if_else(
+        .data$SUTIN_ALL8_BOTH_WAVES,
+        .data$SUT_MEM_ALL8_22,
+        NA_real_
+      ),
+      OSHEA_ALL6_BOTH_WAVES = dplyr::coalesce(
+        .data$OSHEA_MEM_COUNT_16 == 6 & .data$OSHEA_MEM_COUNT_22 == 6,
+        FALSE
+      ),
+      OSHEA_MEM_ALL6_BOTH_16 = dplyr::if_else(
+        .data$OSHEA_ALL6_BOTH_WAVES,
+        .data$OSHEA_MEM_ALL6_16,
+        NA_real_
+      ),
+      OSHEA_MEM_ALL6_BOTH_22 = dplyr::if_else(
+        .data$OSHEA_ALL6_BOTH_WAVES,
+        .data$OSHEA_MEM_ALL6_22,
+        NA_real_
+      )
+    )
+}
+```
+
+## Validate and Summarize Scores
+
+```{r func_validate}
+validate_interview_dates <- function(merge_df) {
+  stopifnot(
+    all(merge_df$INTERVIEW_MONTH_16 %in% c(1:12, NA)),
+    all(merge_df$INTERVIEW_MONTH_22 %in% c(1:12, NA)),
+    all(merge_df$INTERVIEW_YEAR_16 %in% c(2016:2017, NA)),
+    all(merge_df$INTERVIEW_YEAR_22 %in% c(2022:2023, NA))
+  )
+
+  invisible(merge_df)
+}
+
+correlation_summary <- function(x, y, comparison) {
+  keep <- stats::complete.cases(x, y)
+  x_used <- x[keep]
+  y_used <- y[keep]
+
+  if (
+    length(x_used) < 3 ||
+    stats::sd(x_used) == 0 ||
+    stats::sd(y_used) == 0
+  ) {
+    return(tibble::tibble(
+      comparison = comparison,
+      n_complete = length(x_used),
+      pearson_r = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  test <- stats::cor.test(x_used, y_used, method = "pearson")
+
+  tibble::tibble(
+    comparison = comparison,
+    n_complete = length(x_used),
+    pearson_r = unname(test$estimate),
+    p_value = test$p.value
+  )
+}
+
+get_memory_correlation_summary <- function(merge_df) {
+  dplyr::bind_rows(
+    correlation_summary(
+      merge_df$SUT_MEM_16,
+      merge_df$VS4MEM_EAP,
+      "Sutin vs EAP"
+    ),
+    correlation_summary(
+      merge_df$OSHEA_MEM_16,
+      merge_df$VS4MEM_EAP,
+      "O'Shea vs EAP"
+    ),
+    correlation_summary(
+      merge_df$SUT_MEM_16,
+      merge_df$OSHEA_MEM_16,
+      "Sutin vs O'Shea"
+    ),
+    correlation_summary(
+      merge_df$SUT_MEM_ALL8_BOTH_16,
+      merge_df$SUT_MEM_ALL8_BOTH_22,
+      "Sutin all-8: HC16 vs HC22"
+    ),
+    correlation_summary(
+      merge_df$OSHEA_MEM_ALL6_BOTH_16,
+      merge_df$OSHEA_MEM_ALL6_BOTH_22,
+      "O'Shea all-6: HC16 vs HC22"
+    )
+  )
+}
+
+get_score_distribution_summary <- function(merge_df, hc16_count, hc22_count) {
+  score_vars <- c(
+    "SUT_MEM_16",
+    "SUT_MEM_22",
+    "SUT_MEM_CERAD3_16",
+    "SUT_MEM_CERAD3_22",
+    "SUT_MEM_ALL8_BOTH_16",
+    "SUT_MEM_ALL8_BOTH_22",
+    "OSHEA_MEM_16",
+    "OSHEA_MEM_22",
+    "OSHEA_MEM_ALL6_BOTH_16",
+    "OSHEA_MEM_ALL6_BOTH_22"
+  )
+  size_df <- data.frame(
+    score = score_vars
+  ) %>%
+    dplyr::mutate(
+      wave = stringr::str_split_i(.data$score, pattern = "_", i = -1)
+    ) %>%
+    dplyr::left_join(
+      data.frame(wave = c("16", "22"), size = c(hc16_count, hc22_count)),
+      by = "wave"
+    )
+
+  stat_df <- merge_df %>%
+    dplyr::summarise(
+      dplyr::across(
+        dplyr::all_of(score_vars),
+        list(
+          n = ~sum(!is.na(.x)),
+          missing = ~sum(is.na(.x)),
+          mean = ~mean(.x, na.rm = TRUE),
+          sd = ~stats::sd(.x, na.rm = TRUE)
+        )
+      )
+    ) %>%
+    tidyr::pivot_longer(
+      dplyr::everything(),
+      names_to = c("score", ".value"),
+      names_pattern = "^(.*)_(n|missing|mean|sd)$"
+    ) %>%
+    dplyr::left_join(size_df, by = "score") %>%
+    dplyr::mutate(
+      not_recorded = .data$size - .data$n,
+      not_in_wave = .data$missing - .data$not_recorded
+    ) %>%
+    dplyr::select(
+      "n",
+      "missing",
+      "not_recorded",
+      "not_in_wave",
+      "mean",
+      "sd"
+    )
+
+  stat_df
+}
+```
+
+## Save Results
+
+```{r func_save}
+save_hcap_memory_scores <- function(merge_df, data_dir) {
+  write.csv(
+    merge_df,
+    file = file.path(data_dir, "hcap_memory_scores_by_subject.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+## Wrapper Function
+
+```{r func_wrapper}
+process_hcap_merge <- function(hcap_data) {
+  hc16_scores <- make_wave_output(hcap_data$hc16, "16")
+  hc22_scores <- make_wave_output(hcap_data$hc22, "22")
+
+  assert_unique_id(hc16_scores, "HC16 score data")
+  assert_unique_id(hc22_scores, "HC22 score data")
+  assert_unique_id(hcap_data$hsub, "HC16 summary data")
+
+  merge_audit <- get_wave_overlap_audit(hc16_scores, hc22_scores)
+
+  hc16_classification <- get_hc16_classification(hcap_data$hc16)
+  assert_unique_id(hc16_classification, "HC16 classification data")
+
+  merge_df <- merge_wave_scores(
+    hc16_scores,
+    hc22_scores,
+    hc16_classification,
+    hcap_data$hsub
+  )
+
+  # Add back in columns that were dropped due to a rewrite
+  params_df <- hcap_data$hc16$hcap %>%
+    dplyr::select(
+      "HHID", "PN", "R1IWYEAR", "R1IWMONTH", "VS1HCAPDX_EAP", "VS2MEMIMP_EAP"
+    ) %>%
+    dplyr::full_join(
+      hcap_data$hc22$hcap %>%
+        dplyr::select("HHID", "PN", "R2IWYEAR", "R2IWMONTH"),
+      by = c("HHID", "PN"),
+      na_matches = "never"
+    )
+
+  merge_df <- merge_df %>%
+    dplyr::left_join(
+      params_df,
+      by = c("HHID", "PN"),
+      na_matches = "never"
+    )
+
+  list(
+    merge_df = merge_df,
+    merge_audit = merge_audit
+  )
+}
+```
+
+# Analysis
+
+## Load Data
+
+```{r load}
+hcap_data <- load_hcap_merge_data(hrs_dir, data_dir)
+```
+
+## Merge
+
+```{r merge}
+merge_results <- process_hcap_merge(hcap_data)
+merge_df <- merge_results$merge_df
+merge_results$merge_audit
+```
+
+## Check Year Parameters
+
+```{r check_year}
+validate_interview_dates(merge_df)
+```
+
+# Compare Memory
+
+```{r validation}
+correlation_results <- get_memory_correlation_summary(merge_df)
+correlation_results
+
+score_distribution_summary <- get_score_distribution_summary(
+  merge_df,
+  hc16_count = nrow(hcap_data$hc16$hcap),
+  hc22_count = nrow(hcap_data$hc22$hcap)
+)
+score_distribution_summary
+```
+
+# Save
+
+The subject-level file has one row per unique `HHID`/`PN` observed in either
+wave. For each wave it includes the raw task values, the standardized task
+components used in the composites, component counts, primary scores, and
+sensitivity scores. The `*_BOTH_16` and `*_BOTH_22` scores are populated only
+for participants who satisfy the strict all-task requirement in both waves.
+
+```{r save}
+save_hcap_memory_scores(merge_df, data_dir)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

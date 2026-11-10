@@ -1,0 +1,612 @@
+---
+title: "Fit Reduced and Full Mixed Models by MRS for ADNI data"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    # Default printing keeps model and test tables in their R print format
+    df_print: default
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 200)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(lmerTest)
+  library(knitr)
+  library(openxlsx)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"), path = getwd()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+save_dir <- file.path(analysis_dir, "analysis-results", "ADNI")
+```
+
+<style>
+pre, pre code {
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+pre { overflow-x: auto; }
+</style>
+
+# Define Functions
+
+## Reduced Model Results Table
+
+```{r func_results_table}
+reduced_result_table <- function(model, group_name) {
+  # Stop before exporting an incomplete fixed-effect model.
+  if (anyNA(lme4::fixef(model, add.dropped = TRUE))) {
+    stop(
+      group_name,
+      ": the Reduced Model has non-estimable fixed effects. ",
+      "Resolve these before exporting the table."
+    )
+  }
+
+  coef_matrix <- stats::coef(summary(model, ddf = "Satterthwaite"))
+  required_columns <- c("Estimate", "Std. Error", "t value", "Pr(>|t|)")
+  if (!all(required_columns %in% colnames(coef_matrix))) {
+    stop(group_name, ": expected lmerTest coefficient columns were not found.")
+  }
+
+  data.frame(
+    Term = rownames(coef_matrix),
+    Estimate = unname(coef_matrix[, "Estimate"]),
+    StdErr = unname(coef_matrix[, "Std. Error"]),
+    tValue = unname(coef_matrix[, "t value"]),
+    `P-value` = unname(coef_matrix[, "Pr(>|t|)"]),
+    check.names = FALSE, row.names = NULL
+  ) %>%
+    dplyr::mutate(
+      Significance = dplyr::case_when(
+        !is.finite(.data[["P-value"]]) ~ "-",
+        .data[["P-value"]] < 0.001 ~ "***",
+        .data[["P-value"]] < 0.01 ~ "**",
+        .data[["P-value"]] < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    )
+}
+```
+
+## Excel Sheet Text
+
+```{r func_excel_text}
+make_reduced_model_caption <- function(model, group_name, mrs_median) {
+  n_participants <- length(unique(stats::model.frame(model)$RID))
+  n_observations <- stats::nobs(model)
+  split_description <- if (identical(group_name, "High MRS")) {
+    "MRS z-score >"
+  } else {
+    "MRS z-score <="
+  }
+
+  paste0(
+    "ADNI reduced linear mixed-effects model in the ", group_name,
+    " group (N = ", n_participants, " participants; ", n_observations,
+    " observations). Outcome: PHC_MEM. The model includes baseline age, ",
+    "sex, APOE4, education, continuous MRS, baseline pTau, time, and all ",
+    "three pairwise interactions among MRS, pTau, and time, with a ",
+    "participant-specific random intercept. Time is in years. MRS and ",
+    "baseline age use pooled participant-level z-scores; pTau retains ",
+    "its input-data scale. ", group_name, ": ", split_description, " ",
+    format(mrs_median, digits = 6), " (pooled participant-level median)."
+  )
+}
+
+make_reduced_model_footnote <- function() {
+  paste0(
+    "*** P-value < 0.001; ** P-value < 0.01; * P-value < 0.05. ",
+    "Two-sided P-values use Satterthwaite degrees of freedom; models ",
+    "are fitted using REML. Term names match the R model output."
+  )
+}
+```
+
+## Excel Sheet Layout
+
+```{r func_excel_layout}
+write_excel_caption <- function(wb, sheet, caption) {
+  openxlsx::writeData(wb, sheet, caption, startCol = 2, startRow = 1)
+  openxlsx::mergeCells(wb, sheet, cols = 2:7, rows = 1)
+  openxlsx::addStyle(
+    wb, sheet, openxlsx::createStyle(wrapText = TRUE, valign = "top"),
+    rows = 1, cols = 2
+  )
+  openxlsx::setRowHeights(wb, sheet, rows = 1, heights = 110)
+}
+
+write_excel_results_table <- function(wb, sheet, result_table) {
+  header_style <- openxlsx::createStyle(
+    textDecoration = "bold", fgFill = "#E7E6E6", halign = "center",
+    border = c("top", "bottom"), borderStyle = "thin"
+  )
+  openxlsx::writeData(
+    wb, sheet, result_table, startCol = 2, startRow = 2,
+    rowNames = FALSE, headerStyle = header_style, keepNA = FALSE
+  )
+}
+
+write_excel_footnote <- function(wb, sheet, footnote, row) {
+  openxlsx::writeData(wb, sheet, footnote, startCol = 2, startRow = row)
+  openxlsx::mergeCells(wb, sheet, cols = 2:7, rows = row)
+  openxlsx::addStyle(
+    wb, sheet,
+    openxlsx::createStyle(fontSize = 10, wrapText = TRUE, valign = "top"),
+    rows = row, cols = 2
+  )
+  openxlsx::setRowHeights(wb, sheet, rows = row, heights = 32)
+}
+```
+
+## Excel Cell Styles
+
+```{r func_excel_style}
+style_excel_body <- function(wb, sheet, last_row) {
+  body_rows <- seq.int(3L, last_row)
+
+  # Estimate, StdErr, and tValue
+  openxlsx::addStyle(
+    wb, sheet, openxlsx::createStyle(numFmt = "0.000", halign = "right"),
+    rows = body_rows, cols = 3:5, gridExpand = TRUE, stack = TRUE
+  )
+  # P-value
+  openxlsx::addStyle(
+    wb, sheet, openxlsx::createStyle(numFmt = "0.00E+00", halign = "right"),
+    rows = body_rows, cols = 6, gridExpand = TRUE, stack = TRUE
+  )
+  # Significance
+  openxlsx::addStyle(
+    wb, sheet, openxlsx::createStyle(halign = "center"),
+    rows = body_rows, cols = 7, gridExpand = TRUE, stack = TRUE
+  )
+}
+
+style_excel_borders <- function(wb, sheet, last_row) {
+  openxlsx::addStyle(
+    wb, sheet, openxlsx::createStyle(border = "left", borderStyle = "thin"),
+    rows = 2:last_row, cols = 2, gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    wb, sheet, openxlsx::createStyle(border = "right", borderStyle = "thin"),
+    rows = 2:last_row, cols = 7, gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    wb, sheet, openxlsx::createStyle(border = "bottom", borderStyle = "thin"),
+    rows = last_row, cols = 2:7, gridExpand = TRUE, stack = TRUE
+  )
+}
+
+set_excel_dimensions <- function(wb, sheet, last_row) {
+  openxlsx::setRowHeights(wb, sheet, rows = 2:last_row, heights = 20)
+  openxlsx::setColWidths(
+    wb, sheet, cols = 1:7, widths = c(3, 35, 14, 14, 13, 15, 16)
+  )
+}
+
+set_excel_print_options <- function(wb, sheet) {
+  openxlsx::freezePane(wb, sheet, firstActiveRow = 3, firstActiveCol = 3)
+  openxlsx::pageSetup(
+    wb, sheet, orientation = "landscape", fitToWidth = 1, fitToHeight = 1
+  )
+}
+```
+
+## Write Excel
+
+```{r func_excel}
+write_reduced_model_excel <- function(
+    model, result_table, group_name, mrs_median, path
+) {
+  sheet <- "Model results"
+  last_row <- nrow(result_table) + 2L
+
+  wb <- openxlsx::createWorkbook()
+  openxlsx::addWorksheet(wb, sheet, gridLines = FALSE)
+  openxlsx::modifyBaseFont(wb, fontName = "Calibri", fontSize = 11)
+
+  write_excel_caption(
+    wb, sheet, make_reduced_model_caption(model, group_name, mrs_median)
+  )
+  write_excel_results_table(wb, sheet, result_table)
+  style_excel_body(wb, sheet, last_row)
+  style_excel_borders(wb, sheet, last_row)
+  set_excel_dimensions(wb, sheet, last_row)
+  write_excel_footnote(
+    wb, sheet, make_reduced_model_footnote(), row = last_row + 2L
+  )
+  set_excel_print_options(wb, sheet)
+
+  openxlsx::saveWorkbook(wb, file = path, overwrite = TRUE)
+}
+```
+
+# Load Data
+
+```{r load}
+prep_ls <- readRDS(file.path(save_dir, "ADNI_Split.rds"))
+mrs_model_df <- prep_ls$mrs_model_df
+mrs_median <- prep_ls$mrs_median
+mrs_levels <- prep_ls$mrs_levels
+mrs_low_df <- prep_ls$mrs_low_df
+mrs_high_df <- prep_ls$mrs_high_df
+mrs_datasets <- prep_ls$mrs_datasets
+```
+
+# Fit the Reduced Model in Each Dataset
+
+Each model retains the **Reduced Model** formula from the previous file:
+
+- all three two-way interactions
+    - `mrs_z:time`
+    - `baseline_pTau:time`
+    - `mrs_z:baseline_pTau`
+- the original covariates
+- a participant random intercept.
+
+Both MRS and baseline pTau remain continuous within each dataset; the three-way
+interaction is omitted.
+
+Within each MRS dataset:
+
+- `baseline_pTau:time` estimates the difference in annual memory slope per
+one-unit higher baseline pTau on its input-data
+scale.
+- `mrs_z:time` estimates the annual memory-slope difference per one SD higher
+MRS on the original pooled scale.
+
+Separate within-group P values do not test whether pTau-associated slopes differ
+between the two MRS groups.
+
+## Define Model
+
+```{r reduced_model_formula}
+reduced_formula <- stats::as.formula(
+  paste(
+    "PHC_MEM ~ baseline_age_z",
+    "PHC_Sex",
+    "APOE4",
+    "PHC_Education",
+    "mrs_z",
+    "baseline_pTau",
+    "mrs_z*time",
+    "baseline_pTau*time",
+    "mrs_z*baseline_pTau",
+    "(1 | RID)",
+    sep = " + "
+  )
+)
+
+# Check that each dataset supports the requested model before fitting.
+for (group_name in mrs_levels) {
+  group_df <- mrs_datasets[[group_name]]
+  if (
+    dplyr::n_distinct(group_df$RID) < 2L ||
+    nrow(group_df) <= dplyr::n_distinct(group_df$RID)
+  ) {
+    stop(group_name, ": insufficient repeated observations for a random intercept.")
+  }
+
+  for (column in c("mrs_z", "baseline_pTau", "time")) {
+    if (dplyr::n_distinct(group_df[[column]]) < 2L) {
+      stop(group_name, ": ", column, " has no within-group variation.")
+    }
+  }
+
+  if (max(group_df$time) <= 0) {
+    stop(group_name, ": no positive follow-up time.")
+  }
+
+  for (column in c("PHC_Sex", "APOE4")) {
+    if (is.factor(group_df[[column]]) && nlevels(group_df[[column]]) < 2L) {
+      stop(group_name, ": factor ", column, " has only one observed level.")
+    }
+  }
+}
+```
+
+## Low MRS
+
+```{r reduced_low_mrs}
+sf_low <- lmerTest::lmer(
+  reduced_formula,
+  data = mrs_low_df,
+  REML = TRUE,
+  na.action = stats::na.fail
+)
+cat("Reduced Model: Low MRS\n")
+summary(sf_low)
+```
+
+## High MRS
+
+```{r reduced_high_mrs}
+sf_high <- lmerTest::lmer(
+  reduced_formula,
+  data = mrs_high_df,
+  REML = TRUE,
+  na.action = stats::na.fail
+)
+cat("Reduced Model: High MRS\n")
+summary(sf_high)
+```
+
+## Export to Excel
+
+```{r export_reduced_model_excel}
+# Validate both result tables before writing either workbook.
+high_mrs_results <- reduced_result_table(sf_high, "High MRS")
+low_mrs_results <- reduced_result_table(sf_low, "Low MRS")
+reduced_excel_paths <- c(
+  `High MRS` = file.path(save_dir, "ADNI_reduced_model_high_MRS.xlsx"),
+  `Low MRS` = file.path(save_dir, "ADNI_reduced_model_low_MRS.xlsx")
+)
+write_reduced_model_excel(
+  sf_high,
+  high_mrs_results,
+  "High MRS",
+  mrs_median,
+  unname(reduced_excel_paths["High MRS"])
+)
+write_reduced_model_excel(
+  sf_low,
+  low_mrs_results,
+  "Low MRS",
+  mrs_median,
+  unname(reduced_excel_paths["Low MRS"])
+)
+```
+
+# Full Model with Categorical MRS, Baseline pTau, and Time
+
+This additional model uses the pooled complete, finite observations in
+`mrs_model_df`. It uses the same participant-level median split already
+defined above, with **Low MRS as the reference group**. MRS enters this
+model as `MRS_group`; baseline pTau and time remain continuous. The model
+includes all main effects and two-way interactions, the three-way interaction,
+the original covariates, and a participant random intercept.
+
+The `MRS_groupHigh MRS:baseline_pTau:time` coefficient estimates the
+**High-versus-Low difference in the association between baseline pTau and
+annual memory change**. The `baseline_pTau:time` coefficient describes
+that association in Low MRS; adding the three-way coefficient gives the
+corresponding association in High MRS. A positive three-way estimate means
+the pTau-related slope difference is more positive in High MRS. When the
+Low-group association is negative, this can weaken, eliminate, or reverse
+that association, depending on the sum of the two coefficients.
+
+## Define Model
+
+```{r full_categorical_mrs_formula}
+full_mrs_model_df <- mrs_model_df %>%
+  dplyr::mutate(
+    MRS_group = factor(
+      as.character(.data$MRS_group), levels = c("Low MRS", "High MRS")
+    )
+  )
+
+if (
+  anyNA(full_mrs_model_df$MRS_group) ||
+  any(table(full_mrs_model_df$MRS_group) == 0L)
+) {
+  stop("The categorical Full Model requires both Low MRS and High MRS groups.")
+}
+
+categorical_formula <- stats::as.formula(
+  paste(
+    "PHC_MEM ~ baseline_age_z",
+    "PHC_Sex",
+    "APOE4",
+    "PHC_Education",
+    "MRS_group * baseline_pTau * time",
+    "(1 | RID)",
+    sep = " + "
+  )
+)
+```
+
+## Run Model
+
+```{r full_categorical_mrs_model}
+sg_mrs_categorical <- lmerTest::lmer(
+  categorical_formula,
+  data = full_mrs_model_df,
+  contrasts = list(MRS_group = "contr.treatment"),
+  REML = TRUE,
+  na.action = stats::na.fail
+)
+if (anyNA(lme4::fixef(sg_mrs_categorical, add.dropped = TRUE))) {
+  stop(
+    "The categorical Full Model has non-estimable fixed effects. ",
+    "Inspect the covariate and within-group pTau/time variation."
+  )
+}
+cat("Full Model: categorical Low/High MRS x baseline pTau x time\n")
+summary(sg_mrs_categorical)
+```
+
+## Test of the Categorical MRS Three-Way Interaction
+
+This one-degree-of-freedom likelihood-ratio test compares two pooled
+categorical-MRS models on identical observations. Both are fitted by
+maximum likelihood. The comparison model removes only the three-way
+interaction and retains all main effects, two-way interactions, covariates,
+and the participant random intercept. It is a separate pooled model from
+the two dataset-specific Reduced Models above. The REML summary above
+and this ML likelihood-ratio test use different inference procedures and
+can produce different P values.
+
+```{r categorical_mrs_three_way_test}
+sg_mrs_categorical_ml <- stats::update(sg_mrs_categorical, REML = FALSE)
+sf_mrs_categorical_ml <- stats::update(
+  sg_mrs_categorical_ml,
+  . ~ . - MRS_group:baseline_pTau:time
+)
+stopifnot(
+  stats::nobs(sg_mrs_categorical_ml) == stats::nobs(sf_mrs_categorical_ml),
+  stats::nobs(sg_mrs_categorical_ml) == nrow(full_mrs_model_df)
+)
+categorical_mrs_interaction_df <-
+  attr(stats::logLik(sg_mrs_categorical_ml), "df") -
+  attr(stats::logLik(sf_mrs_categorical_ml), "df")
+
+if (categorical_mrs_interaction_df != 1L) {
+  stop(
+    "The categorical-MRS three-way interaction is not fully estimable ",
+    "(expected one additional parameter)."
+  )
+}
+
+categorical_mrs_three_way_lrt <- stats::anova(
+  sf_mrs_categorical_ml, sg_mrs_categorical_ml, refit = FALSE
+)
+categorical_mrs_three_way_lrt
+```
+
+# Full Model with Continuous MRS, Baseline pTau, and Time
+
+This pooled model uses the same complete, finite observations as the
+categorical full model. MRS enters as the continuous `mrs_z` variable on
+its original pooled participant-level z-score scale. Baseline pTau retains
+its input-data scale, and time is measured in years. The model includes
+all main effects, all two-way interactions, the three-way interaction,
+the same covariates, and a participant random intercept.
+
+The `mrs_z:baseline_pTau:time` coefficient estimates the change in the
+association between baseline pTau and annual memory change per one SD
+higher MRS on the original pooled scale. At an MRS z-score of `m`, that
+pTau association is `baseline_pTau:time + m * mrs_z:baseline_pTau:time`.
+A positive three-way coefficient makes this association more positive
+as MRS increases; when the association at lower MRS is negative, this
+can represent a weaker association of pTau with faster memory decline.
+
+## Define Model
+
+```{r full_continuous_mrs_formula}
+continuous_formula <- stats::as.formula(
+  paste(
+    "PHC_MEM ~ baseline_age_z",
+    "PHC_Sex",
+    "APOE4",
+    "PHC_Education",
+    "mrs_z * baseline_pTau * time",
+    "(1 | RID)",
+    sep = " + "
+  )
+)
+```
+
+## Run Model
+
+```{r full_continuous_mrs_model}
+sg_mrs_continuous <- lmerTest::lmer(
+  continuous_formula,
+  data = full_mrs_model_df,
+  REML = TRUE,
+  na.action = stats::na.fail
+)
+
+if (anyNA(lme4::fixef(sg_mrs_continuous, add.dropped = TRUE))) {
+  stop(
+    "The continuous Full Model has non-estimable fixed effects. ",
+    "Inspect the covariate and MRS/pTau/time variation."
+  )
+}
+
+stopifnot(
+  stats::nobs(sg_mrs_continuous) == stats::nobs(sg_mrs_categorical),
+  identical(
+    rownames(stats::model.frame(sg_mrs_continuous)),
+    rownames(stats::model.frame(sg_mrs_categorical))
+  )
+)
+cat("Full Model: continuous MRS z x baseline pTau x time\n")
+summary(sg_mrs_continuous)
+```
+
+## Test of the Continuous MRS Three-Way Interaction
+
+This one-degree-of-freedom likelihood-ratio test compares pooled continuous
+MRS models fitted by maximum likelihood on identical observations. The
+comparison model removes only `mrs_z:baseline_pTau:time` and retains every
+main effect, two-way interaction, covariate, and the random intercept.
+The REML summary and ML likelihood-ratio test use different inference
+procedures and can produce different P values.
+
+```{r continuous_mrs_three_way_test}
+sg_mrs_continuous_ml <- stats::update(sg_mrs_continuous, REML = FALSE)
+sf_mrs_continuous_ml <- stats::update(
+  sg_mrs_continuous_ml,
+  . ~ . - mrs_z:baseline_pTau:time
+)
+stopifnot(
+  stats::nobs(sg_mrs_continuous_ml) == stats::nobs(sf_mrs_continuous_ml),
+  stats::nobs(sg_mrs_continuous_ml) == nrow(full_mrs_model_df),
+  identical(
+    rownames(stats::model.frame(sg_mrs_continuous_ml)),
+    rownames(stats::model.frame(sf_mrs_continuous_ml))
+  )
+)
+continuous_mrs_interaction_df <-
+  attr(stats::logLik(sg_mrs_continuous_ml), "df") -
+  attr(stats::logLik(sf_mrs_continuous_ml), "df")
+if (continuous_mrs_interaction_df != 1L) {
+  stop(
+    "The continuous-MRS three-way interaction is not fully estimable ",
+    "(expected one additional parameter)."
+  )
+}
+continuous_mrs_three_way_lrt <- stats::anova(
+  sf_mrs_continuous_ml, sg_mrs_continuous_ml, refit = FALSE
+)
+continuous_mrs_three_way_lrt
+```
+
+# Save
+
+```{r save}
+saveRDS(
+  list(
+    sf_low = sf_low,
+    sf_high = sf_high,
+    sg_mrs_categorical = sg_mrs_categorical,
+    sg_mrs_continuous = sg_mrs_continuous
+  ),
+  file.path(save_dir, "ADNI_Models.rds")
+)
+cat("Saved:", file.path(save_dir, "ADNI_Models.rds"), "\n")
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

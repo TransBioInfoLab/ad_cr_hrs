@@ -1,0 +1,190 @@
+---
+title: "Generate a Table of ADNI Subject Characteristics and Compare to HRS"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+adni_dir <- file.path(analysis_dir, "analysis-results", "ADNI")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "characteristics_functions.R"))
+```
+
+# Define Functions
+
+## Cohort Comparison Tests
+
+```{r func_stats}
+get_numeric_signif <- function(data1, data2, column) {
+  res <- stats::wilcox.test(
+    data1, data2, paired = FALSE, alternative = "two.sided"
+  )
+  data.frame(
+    label = column,
+    method = "numeric",
+    stat = res$statistic,
+    pval = res$p.value
+  )
+}
+
+get_categoric_signif <- function(data1, data2, column) {
+  tab <- table(
+    cohort = rep(c("ADNI", "HRS"), c(length(data1), length(data2))),
+    category = c(data1, data2)
+  )
+
+  res <- stats::fisher.test(tab)
+
+  data.frame(
+    label = column,
+    method = "categoric",
+    stat = res$estimate,
+    pval = res$p.value
+  )
+}
+
+get_signif <- function(
+    data1, data2, column, category = c("numeric", "categoric")
+) {
+  category <- match.arg(category)
+
+  if (category == "numeric") {
+    res_df <- get_numeric_signif(data1, data2, column)
+  } else {
+    res_df <- get_categoric_signif(data1, data2, column)
+  }
+
+  res_df
+}
+```
+
+# Get Table
+
+## Load Phenotypes
+
+```{r load}
+adni_data <- readRDS(file.path(adni_dir, "ADNI_2025_MCI_future_data.rds"))
+
+pheno_df <- adni_data$pheno_df
+longitudinal_df <- adni_data$longitudinal_df %>%
+  dplyr::select("RID", "PHC_Education") %>%
+  dplyr::distinct()
+
+pheno_df <- pheno_df %>%
+  dplyr::left_join(longitudinal_df, by = "RID") %>%
+  as.data.frame() %>%
+  dplyr::mutate(
+    APOE4_carrier = dplyr::case_when(
+      is.na(.data$APOE4) ~ NA,
+      .data$APOE4 == 0 ~ "No",
+      TRUE ~ "Yes"
+    )
+  )
+```
+
+## Compile Statistics
+
+```{r stats}
+characteristic_types <- c(
+  baseline_age = "numeric",
+  Gender = "categoric",
+  APOE4_carrier = "categoric",
+  PHC_Education = "numeric",
+  raw_pTau = "numeric"
+)
+
+res_df <- summarize_characteristics(pheno_df, characteristic_types)
+
+res_df
+```
+
+# Run Comparison
+
+## Load HRS Data
+
+```{r load_hrs}
+hrs_df <- read_hrs_characteristics(data_dir, longitudinal = TRUE)
+```
+
+## Do Statistical Comparisons
+
+```{r comparison}
+analysis_df <- data.frame(
+  hrs_columns = c(
+    "Age",
+    "Gender",
+    "APOE4_carrier",
+    "Education"
+  ),
+  adni_columns = c(
+    "baseline_age",
+    "Gender",
+    "APOE4_carrier",
+    "PHC_Education"
+  ),
+  categories = c(
+    "numeric",
+    "categoric",
+    "categoric",
+    "numeric"
+  )
+)
+
+res_df <- plyr::ldply(
+  .data = 1:nrow(analysis_df),
+  .fun = function(index) {
+    hrs_column <- analysis_df$hrs_columns[[index]]
+    adni_column <- analysis_df$adni_columns[[index]]
+    category <- analysis_df$categories[[index]]
+
+    get_signif(
+      pheno_df[, adni_column], hrs_df[, hrs_column], hrs_column, category
+    )
+  }
+)
+
+res_df
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

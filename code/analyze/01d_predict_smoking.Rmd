@@ -1,0 +1,238 @@
+---
+title: "Calculate probable smoking status using DNAm data"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(SummarizedExperiment)
+  library(EpiSmokEr)
+  library(EpiSmokEr2)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION", "data")
+data_dir <- file.path(analysis_dir, "data")
+```
+
+# Load Data
+
+```{r load}
+pheno_df <- read.csv(file.path(data_dir, "phenotype.csv"))
+
+# We use normalized DNAm data for the analysis. However, the fully harmonized
+# data does an extra filtering step after normalization, so we need to
+# filter down to the relevant samples
+dnam_data <- readRDS(
+  file.path(hrs_dir, "normalized", "HRS_White_NHispanic_Autosomal.RDS")
+)
+ref_df <- read.table(
+  file.path(hrs_dir, "submission", "HRS_White_NHispanic_full_pheno.tsv"),
+  sep = "\t",
+  header = TRUE
+)
+dnam_data <- dnam_data[
+  , dnam_data$SubjectID_Submitter %in% ref_df$SubjectID_Submitter
+]
+
+colnames(dnam_data) <- dnam_data$SubjectID_Submitter
+```
+
+# Filter Data
+
+```{r filter}
+pheno_df <- pheno_df %>%
+  dplyr::filter(
+    # Filter to non-Hispanic White NCIND
+    !is.na(.data$RAHISPAN),
+    .data$RAHISPAN == 0,
+    !is.na(.data$RARACEM),
+    .data$RARACEM == 1,
+    # Filter to subjects with DNAm Data
+    !is.na(.data$SubjectID_Submitter),
+    .data$SubjectID_Submitter %in% colnames(dnam_data)
+  )
+
+# We drop dnam data for which we don't have matching phenotype information
+# And make sure that the two are aligned
+dnam_data <- dnam_data[, pheno_df$SubjectID_Submitter, drop = FALSE]
+```
+
+# Predict Smoking EpiSmokEr
+
+EpiSmokEr2 doesn't give a singular smoking score, so we run the prediction with
+both EpiSmokEr and EpiSmokEr2
+
+```{r predict}
+beta <- SummarizedExperiment::assays(dnam_data)$dnam
+# RAGENDER records 1 = MALE, 2 = FEMALE. EpiSmokEr requires 1 = male, 2 = female
+samplesheet <- pheno_df %>%
+  dplyr::select(sex = "RAGENDER")
+row.names(samplesheet) <- colnames(beta)
+
+sst <- EpiSmokEr::epismoker(
+  dataset = beta,
+  samplesheet = samplesheet,
+  method = "SSt"
+)
+ssc <- EpiSmokEr::epismoker(
+  dataset = beta,
+  method = "SSc"
+)
+
+epi_df <- sst %>%
+  dplyr::select(
+    SubjectID_Submitter = "SampleName",
+    Smoking_Predicted = "PredictedSmokingStatus"
+  ) %>%
+  dplyr::left_join(
+    ssc %>%
+      dplyr::select(
+        SubjectID_Submitter = "SampleName",
+        Smoking_Score = "smokingScore"
+      ),
+    by = "SubjectID_Submitter",
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+```
+
+# Predict Smoking EpiSmokEr2
+
+```{r predict_2}
+beta <- SummarizedExperiment::assays(dnam_data)$dnam
+# RAGENDER records 1 = MALE, 2 = FEMALE. EpiSmokEr2 requires 0 = female, 1 = male
+sex.v <- ifelse(pheno_df$RAGENDER == 1, 1, 0)
+epi2_df <- EpiSmokEr2::epismoker(data.m = beta, sex.v = sex.v, array = "EPIC") %>%
+  tibble::rownames_to_column("SubjectID_Submitter") %>%
+  dplyr::mutate(
+    Class = dplyr::case_when(
+      .data$Class == "NS" ~ "Never",
+      .data$Class == "FS" ~ "Former",
+      .data$Class == "CS" ~ "Current",
+      TRUE ~ NA_character_
+    ),
+    CvsN = dplyr::case_when(
+      .data$CvsN == "NS" ~ "Never",
+      .data$CvsN == "CS" ~ "Current",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::rename(
+    Smoking_Current = "CS",
+    Smoking_Former = "FS",
+    Smoking_Never = "NS",
+    Smoking_Class = "Class",
+    Smoking_Binary = "CvsN"
+  )
+```
+
+# Create Smoking Dataframe
+
+```{r smoke_df}
+smoke_df <- pheno_df %>%
+  dplyr::mutate(
+    # Calculate recorded - not predicted - smoking state
+    Smoking = dplyr::case_when(
+      !is.na(.data$R13SMOKEV) & .data$R13SMOKEV == 0 ~ "Never",
+      !is.na(.data$R13SMOKEN) & .data$R13SMOKEN == 1 ~ "Current",
+      !is.na(.data$R13SMOKEN) &
+        !is.na(.data$R13SMOKEV) &
+        .data$R13SMOKEV == 1 &
+        .data$R13SMOKEN == 0 ~ "Former",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Filter to key columns
+  dplyr::select(
+    "HHID",
+    "PN",
+    "SubjectID_Submitter",
+    "Smoking"
+  ) %>%
+  dplyr::left_join(
+    epi_df,
+    by = "SubjectID_Submitter",
+    relationship = "one-to-one",
+    na_matches = "never"
+  ) %>%
+  dplyr::left_join(
+    epi2_df,
+    by = "SubjectID_Submitter",
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+```
+
+# Add Celltype Proportions
+
+```{r cell_prop}
+cell_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame() %>%
+  dplyr::select(
+    "SubjectID_Submitter",
+    prop_GR = "GR",
+    prop_NK = "NK",
+    prop_B = "B",
+    prop_CD4 = "CD4",
+    prop_CD8 = "CD8",
+    prop_MO = "MO"
+  )
+
+smoke_df <- smoke_df %>%
+  dplyr::left_join(
+    cell_df,
+    by = "SubjectID_Submitter",
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+```
+
+# Save
+
+```{r save}
+write.csv(
+  smoke_df,
+  file = file.path(data_dir, "smoking.csv"),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

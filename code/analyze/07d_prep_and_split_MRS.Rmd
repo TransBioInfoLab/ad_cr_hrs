@@ -1,0 +1,256 @@
+---
+title: "Load ADNI data, and split into Low and High MRS"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    # Default printing keeps model and test tables in their R print format
+    df_print: default
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 200)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"), path = getwd()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+save_dir <- file.path(analysis_dir, "analysis-results", "ADNI")
+```
+
+# Load Data
+
+```{r load}
+adni_data <- readRDS(
+  file.path(save_dir, "ADNI_2025_MCI_future_data.rds")
+)
+mrs_df <- readr::read_csv(
+  file.path(save_dir, "EAP_MRS_scores.csv"),
+  show_col_types = FALSE
+)
+```
+
+# Analyze
+
+## Standardize Data
+
+MRS and baseline age are standardized once per participant in the pooled
+dataset, using the same procedure as the previous file. These z-scores
+are retained when the data are divided into MRS groups.
+
+```{r standardize_data}
+stat_df <- adni_data$longitudinal_df %>%
+  dplyr::inner_join(
+    mrs_df %>%
+      dplyr::select("sample_id", "MRS_raw", "mrs"),
+    by = c("sample" = "sample_id"),
+    relationship = "many-to-one",
+    na_matches = "never"
+  ) %>%
+  dplyr::mutate(
+    RID = factor(.data$RID),
+    PHC_Sex = factor(.data$PHC_Sex)
+  )
+
+zval_df <- stat_df %>%
+  dplyr::distinct(.data$RID, .keep_all = TRUE) %>%
+  dplyr::mutate(
+    mrs_z = as.numeric(scale(.data$mrs)),
+    baseline_age_z = as.numeric(scale(.data$baseline_age))
+  ) %>%
+  dplyr::select("RID", "mrs_z", "baseline_age_z")
+
+stat_df <- stat_df %>%
+  dplyr::left_join(
+    zval_df,
+    by = "RID",
+    relationship = "many-to-one",
+    na_matches = "never"
+  )
+
+stopifnot(
+  setequal(unique(as.character(stat_df$RID)),
+           as.character(adni_data$pheno_df$RID))
+)
+```
+
+## Add High and Low MRS Groups
+
+The cutoff is the participant-level median MRS z-score among participants
+with at least one complete, finite model observation.
+
+- **Low MRS** includes values at or below the median;
+- **High MRS** includes values above the median.
+
+Every usable visit from a participant receives the same MRS group. Tied
+values remain together, so the groups may differ in size. MRS retains the
+original pooled participant-level z-score scale, and baseline pTau retains
+the scale used in the input data.
+
+```{r baseline_mrs_groups}
+model_columns <- c(
+  "PHC_MEM",
+  "baseline_age_z",
+  "PHC_Sex",
+  "APOE4",
+  "PHC_Education",
+  "mrs_z",
+  "baseline_pTau",
+  "time",
+  "RID"
+)
+missing_columns <- setdiff(model_columns, names(stat_df))
+if (length(missing_columns)) {
+  stop("Missing model columns: ", paste(missing_columns, collapse = ", "))
+}
+
+# Remove unusable visits; retain a participant's other usable visits.
+mrs_model_df <- stat_df[
+  stats::complete.cases(stat_df[, model_columns, drop = FALSE]),
+  , drop = FALSE
+]
+numeric_columns <- model_columns[vapply(
+  mrs_model_df[, model_columns, drop = FALSE], is.numeric, logical(1)
+)]
+for (column in numeric_columns) {
+  mrs_model_df <- mrs_model_df[
+    is.finite(mrs_model_df[[column]]), , drop = FALSE
+  ]
+}
+mrs_model_df <- droplevels(mrs_model_df)
+if (!nrow(mrs_model_df)) stop("No complete, finite model observations.")
+if (any(mrs_model_df$time < 0)) {
+  stop("Negative follow-up times found. Check the definition of time.")
+}
+
+baseline_check <- mrs_model_df %>%
+  dplyr::group_by(.data$RID) %>%
+  dplyr::summarise(
+    n_ptau = dplyr::n_distinct(.data$baseline_pTau),
+    n_mrs = dplyr::n_distinct(.data$mrs_z),
+    .groups = "drop"
+  )
+if (any(baseline_check$n_ptau != 1L | baseline_check$n_mrs != 1L)) {
+  stop("Baseline pTau or MRS varies within RID. Resolve baseline duplicates first.")
+}
+
+mrs_participants <- mrs_model_df %>%
+  dplyr::arrange(.data$RID, .data$time) %>%
+  dplyr::distinct(.data$RID, .keep_all = TRUE)
+if (nrow(mrs_participants) < 2L) {
+  stop("At least two participants are needed to define high and low MRS groups.")
+}
+mrs_median <- stats::median(mrs_participants$mrs_z)
+if (!is.finite(mrs_median)) stop("The MRS median is not finite.")
+mrs_levels <- c("Low MRS", "High MRS")
+mrs_participants$MRS_group <- factor(
+  ifelse(mrs_participants$mrs_z <= mrs_median, "Low MRS", "High MRS"),
+  levels = mrs_levels
+)
+if (any(table(mrs_participants$MRS_group) == 0L)) {
+  stop("The median split produced an empty MRS group. Inspect the MRS distribution.")
+}
+
+mrs_model_df <- mrs_model_df %>%
+  dplyr::left_join(
+    dplyr::select(mrs_participants, "RID", "MRS_group"),
+    by = "RID", relationship = "many-to-one", na_matches = "never"
+  )
+
+knitr::kable(
+  data.frame(percentile = "50th percentile (median)", mrs_z = mrs_median),
+  digits = 4, caption = "Participant-level MRS z-score median cutoff"
+)
+```
+
+## Divide Data into Two Datasets
+
+```{r split_datasets}
+mrs_low_df <- mrs_model_df %>%
+  dplyr::filter(.data$MRS_group == "Low MRS") %>%
+  droplevels()
+mrs_high_df <- mrs_model_df %>%
+  dplyr::filter(.data$MRS_group == "High MRS") %>%
+  droplevels()
+
+mrs_datasets <- setNames(list(mrs_low_df, mrs_high_df), mrs_levels)
+mrs_group_summary <- mrs_model_df %>%
+  dplyr::group_by(.data$MRS_group) %>%
+  dplyr::summarise(
+    n_participants = dplyr::n_distinct(.data$RID),
+    n_observations = dplyr::n(),
+    max_time_years = max(.data$time),
+    .groups = "drop"
+  ) %>%
+  dplyr::left_join(
+    mrs_participants %>%
+      dplyr::group_by(.data$MRS_group) %>%
+      dplyr::summarise(
+        MRS_z_min = min(.data$mrs_z),
+        MRS_z_median = stats::median(.data$mrs_z),
+        MRS_z_max = max(.data$mrs_z),
+        pTau_min = min(.data$baseline_pTau),
+        pTau_median = stats::median(.data$baseline_pTau),
+        pTau_max = max(.data$baseline_pTau),
+        .groups = "drop"
+      ),
+    by = "MRS_group", relationship = "one-to-one"
+  )
+
+knitr::kable(
+  mrs_group_summary, digits = 3,
+  caption = "Participants, usable visits, and predictor ranges in each MRS dataset"
+)
+```
+
+# Save
+
+```{r save}
+saveRDS(
+  list(
+    mrs_model_df = mrs_model_df,
+    mrs_participants = mrs_participants,
+    mrs_median = mrs_median,
+    mrs_levels = mrs_levels,
+    mrs_low_df = mrs_low_df,
+    mrs_high_df = mrs_high_df,
+    mrs_datasets = mrs_datasets,
+    mrs_group_summary = mrs_group_summary
+  ),
+  file.path(save_dir, "ADNI_Split.rds")
+)
+cat("Saved:", file.path(save_dir, "ADNI_Split.rds"), "\n")
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

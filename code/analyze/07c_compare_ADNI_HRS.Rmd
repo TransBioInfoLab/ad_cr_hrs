@@ -1,0 +1,394 @@
+---
+title: "Compare significant CpGs in ADNI and HRS"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(readr)
+  library(lme4)
+  library(lmerTest)
+  library(broom.mixed)
+  library(ggplot2)
+  library(tidyr)
+  library(knitr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+adni_dir <- file.path(base_dir, "AD_CR")
+save_dir <- file.path(analysis_dir, "analysis-results")
+adni_save_dir <- file.path(
+  adni_dir, "analysis_results", "only_amyloid_positive_2_stage_approach"
+)
+```
+
+# Get Signif Probes
+
+```{r get_signif}
+hrs_df <- read.csv(
+  file.path(save_dir, "comb-p-DMRs", "interact_mQTLs_inputs.csv")
+) %>%
+  dplyr::select(CpG = "cpgs", Sources_HRS = "Sources")
+adni_df <- read.csv(
+  file.path(adni_save_dir, "comb-p-DMRs", "MCI_mQTLs_inputs.csv")
+) %>%
+  dplyr::filter(.data$IQR_include == 1) %>%
+  dplyr::select(CpG = "cpgs", Sources_ADNI = "Sources")
+
+signif_df <- hrs_df %>%
+  dplyr::full_join(adni_df, by = "CpG") %>%
+  dplyr::mutate(
+    dataset = dplyr::case_when(
+      is.na(.data$Sources_HRS) ~ "ADNI",
+      is.na(.data$Sources_ADNI) ~ "HRS",
+      TRUE ~ "Both"
+    )
+  )
+```
+
+# Get Probe Statistics
+
+```{r get_stats}
+hrs_df <- read.csv(
+  file.path(save_dir, "linear_model", "EAP_stats_bacon_interact.csv")
+)
+adni_df <- read.csv(
+  file.path(adni_save_dir, "linear_model_MCI", "PHC_stats_bacon_interact.csv")
+)
+```
+
+# Merge Results
+
+```{r merge}
+annot_df <- hrs_df %>%
+  dplyr::select(
+    "CpG",
+    "Chr",
+    "Position",
+    "GREAT_annotation",
+    "UCSC_RefGene_Name",
+    "UCSC_RefGene_Group",
+    "Relation_to_Island"
+  ) %>%
+  # Add an empty column for easier visual separation
+  dplyr::mutate(
+    ` ` = ""
+  )
+
+hrs_df <- hrs_df %>%
+  dplyr::select(
+    "CpG",
+    estimate_HRS = "estimate_bacon",
+    std_err_HRS = "std_error_bacon",
+    pvalue_HRS = "pvalue_bacon",
+    fdr_HRS = "fdr_bacon",
+    IAR_HRS = "IQR",
+    fdr_exclude_iqr_lt2_HRS = "fdr_exclude_iqr_lt2_bacon"
+  ) %>%
+  # Add an empty column for easier visual separation
+  dplyr::mutate(
+    `  ` = ""
+  )
+
+adni_df <- adni_df %>%
+  dplyr::select(
+    "CpG",
+    estimate_ADNI = "estimate_bacon",
+    std_err_ADNI = "std_error_bacon",
+    pvalue_ADNI = "pvalue_bacon",
+    fdr_ADNI = "fdr_bacon",
+    IAR_ADNI = "IQR",
+    fdr_exclude_iqr_lt2_ADNI = "fdr_exclude_iqr_lt2_bacon"
+  )
+
+merge_df <- signif_df %>%
+  dplyr::left_join(
+    annot_df,
+    by = "CpG",
+    relationship = "one-to-one",
+    na_matches = "never"
+  ) %>%
+  dplyr::left_join(
+    hrs_df,
+    by = "CpG",
+    relationship = "one-to-one",
+    na_matches = "never"
+  ) %>%
+  dplyr::left_join(
+    adni_df,
+    by = "CpG",
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+```
+
+# Plot
+
+```{r plot, fig.width = 8, fig.height = 8}
+add_annotation <- function(p, plot_df) {
+  # Calculate Spearman correlation and its two-sided P-value
+  cor_result <- stats::cor.test(
+    plot_df$estimate_ADNI, plot_df$estimate_HRS, method = "spearman"
+  )
+
+  # Create the annotation text
+  stats_label <- sprintf(
+    "Spearman \u03c1 = %.3f\nTwo-sided P = %.2f \u00d7 10\u207b\u2074\nn = %d CpGs",
+    unname(cor_result$estimate),
+    cor_result$p.value / 1e-4,
+    nrow(plot_df)
+  )
+
+  p +
+    ggplot2::annotate(
+      "label",
+      x = 7.75,
+      y = 1.33,
+      label = stats_label,
+      hjust = 1,
+      vjust = 1,
+      size = 5.2,
+      lineheight = 1.3,
+      color = text_color,
+      fill = "white",
+      linewidth = 0.4,
+      label.padding = grid::unit(0.4, "lines"),
+      label.r = grid::unit(0.4, "lines")
+    )
+}
+
+add_scales <- function(p, plot_df) {
+  p +
+    ggplot2::scale_x_continuous(
+      breaks = seq(-8, 8, by = 2)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = seq(-1, 1, by = 0.5),
+      labels = function(x) sprintf("%.1f", x)
+    ) +
+    ggplot2::coord_cartesian(
+      xlim = c(-9.4, 8.2),
+      ylim = c(-1.12, 1.42),
+      expand = FALSE
+    ) +
+    # Titles and caption
+    ggplot2::labs(
+      title = "CpG effect estimates in ADNI and HRS",
+      x = "estimate_ADNI",
+      y = "estimate_HRS",
+      caption = paste0(
+        "Each point represents one CpG. All ",
+        nrow(plot_df),
+        " complete pairs are shown."
+      )
+    )
+}
+
+adjust_theme <- function(p) {
+  p +
+    ggplot2::theme_classic(base_size = 17) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        size = 22,
+        face = "bold",
+        color = text_color,
+        hjust = 0.5,
+        margin = ggplot2::margin(b = 22)
+      ),
+      axis.title = ggplot2::element_text(
+        size = 19,
+        color = text_color
+      ),
+      axis.title.x = ggplot2::element_text(
+        margin = ggplot2::margin(t = 14)
+      ),
+      axis.title.y = ggplot2::element_text(
+        margin = ggplot2::margin(r = 14)
+      ),
+      axis.text = ggplot2::element_text(
+        size = 16,
+        color = "#455369"
+      ),
+      axis.line = ggplot2::element_line(
+        color = axis_color,
+        linewidth = 0.55
+      ),
+      axis.ticks = ggplot2::element_line(
+        color = axis_color,
+        linewidth = 0.55
+      ),
+      axis.ticks.length = grid::unit(7, "pt"),
+
+      plot.caption = ggplot2::element_text(
+        size = 13,
+        color = "#68758A",
+        hjust = 0.5,
+        margin = ggplot2::margin(t = 14)
+      ),
+      plot.margin = ggplot2::margin(
+        t = 25,
+        r = 24,
+        b = 12,
+        l = 25
+      )
+    )
+}
+
+generate_initial_plot <- function(plot_df) {
+  p <- ggplot2::ggplot(
+    plot_df,
+    mapping = ggplot2::aes(x = estimate_ADNI, y = estimate_HRS)
+  ) +
+    # Dashed reference lines at zero
+    ggplot2::geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      color = line_color,
+      linewidth = 0.5
+    ) +
+    ggplot2::geom_vline(
+      xintercept = 0,
+      linetype = "dashed",
+      color = line_color,
+      linewidth = 0.5
+    ) +
+    # Blue scatterplot points with subtle white outlines
+    ggplot2::geom_point(
+      shape = 21,
+      fill = point_blue,
+      color = "white",
+      size = 3,
+      stroke = 0.3,
+      alpha = 0.95
+    )
+
+  p
+}
+
+generate_comparison_plot <- function(plot_df) {
+  p <- generate_initial_plot(plot_df) %>%
+    add_annotation(plot_df) %>%
+    add_scales(plot_df) %>%
+    adjust_theme()
+
+  p
+}
+
+# Colors
+point_blue <- "#5084A3"
+text_color <- "#263244"
+axis_color <- "#69778D"
+line_color <- "#91A0B2"
+
+p <- generate_comparison_plot(merge_df)
+
+p
+```
+
+# Filter HRS CpGs Replicated in ADNI
+
+Counts reported in the Results, and the CpGs in Supplementary Table 11:
+HRS-selected CpGs whose DNAm x pTau interaction in ADNI is nominally
+significant (P < 0.05) with the same direction as in HRS. CpGs in DMRs are
+kept regardless of their individual HRS P-value.
+
+```{r filter}
+compare_df <- merge_df %>%
+  dplyr::filter(
+    !is.na(.data$estimate_HRS),
+    !is.na(.data$estimate_ADNI)
+  ) %>%
+  dplyr::mutate(
+    same_direction = sign(.data$estimate_HRS) == sign(.data$estimate_ADNI)
+  )
+
+hrs_selected_df <- compare_df %>%
+  dplyr::filter(!is.na(.data$Sources_HRS))
+
+filtered_df <- hrs_selected_df %>%
+  dplyr::filter(
+    .data$same_direction,
+    .data$pvalue_ADNI < 0.05
+  ) %>%
+  dplyr::select(-"same_direction")
+
+count_df <- data.frame(
+  group = c(
+    "All selected CpGs (either study)",
+    "HRS-selected CpGs",
+    "HRS-selected, ADNI P < 0.05 and same direction"
+  ),
+  n = c(nrow(compare_df), nrow(hrs_selected_df), nrow(filtered_df)),
+  same_direction = c(
+    sum(compare_df$same_direction),
+    sum(hrs_selected_df$same_direction),
+    nrow(filtered_df)
+  )
+)
+
+knitr::kable(count_df)
+knitr::kable(table(filtered_df$Sources_HRS), col.names = c("Sources_HRS", "n"))
+```
+
+# Save
+
+```{r save}
+write.csv(
+  merge_df,
+  file = file.path(save_dir, "ADNI", "ADNI_HRS_Compare.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  filtered_df,
+  file = file.path(save_dir, "ADNI", "ADNI_HRS_Filtered.csv"),
+  row.names = FALSE
+)
+
+ggplot2::ggsave(
+  filename = file.path(save_dir, "plots", "ADNI_HRS_scatterplot.pdf"),
+  plot = p,
+  width = 12,
+  height = 10.3,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

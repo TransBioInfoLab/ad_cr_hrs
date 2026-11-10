@@ -1,0 +1,254 @@
+---
+title: "Merge results and filter to Non-Hispanic White, MCI data"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")
+data_dir <- file.path(analysis_dir, "data")
+
+stopifnot(dir.exists(hrs_dir))
+
+if (!dir.exists(data_dir)) dir.create(data_dir, recursive = TRUE)
+```
+
+# Read Data
+
+```{r read}
+pheno_df <- read.csv(file.path(data_dir, "phenotype.csv"))
+mem_df <- read.csv(file.path(data_dir, "hcap_memory_scores_by_subject.csv"))
+smoke_df <- read.csv(file.path(data_dir, "smoking.csv"))
+```
+
+# Merge Data
+
+```{r merge}
+# Whole years plus months as a fraction of a year; months are optional
+years_plus_months <- function(years, months) {
+  dplyr::case_when(
+    is.na(years) ~ NA_real_,
+    is.na(months) ~ years,
+    TRUE ~ years + months / 12
+  )
+}
+
+merge_df <- pheno_df %>%
+  dplyr::left_join(
+    mem_df,
+    by = c("HHID", "PN"),
+    relationship = "one-to-one",
+    na_matches = "never"
+  ) %>%
+  dplyr::left_join(
+    smoke_df,
+    by = c("HHID", "PN", "SubjectID_Submitter"),
+    relationship = "one-to-one",
+    na_matches = "never"
+  ) %>%
+  dplyr::mutate(
+    Age_year = .data$R1IWYEAR - .data$RABYEAR,
+    Age_month = .data$R1IWMONTH - .data$RABMONTH,
+    time_year = .data$R2IWYEAR - .data$R1IWYEAR,
+    time_month = .data$R2IWMONTH - .data$R1IWMONTH,
+    Smoking_Imputed = ifelse(is.na(.data$Smoking), 1, 0),
+    Smoking = ifelse(is.na(.data$Smoking), .data$Smoking_Class, .data$Smoking),
+    Age = years_plus_months(.data$Age_year, .data$Age_month),
+    time = years_plus_months(.data$time_year, .data$time_month),
+    Education_category = dplyr::case_when(
+      is.na(.data$RAEDUC) ~ NA_character_,
+      .data$RAEDUC == 1 ~ "No_Degree",
+      .data$RAEDUC %in% c(2, 3) ~ "HS",
+      .data$RAEDUC %in% c(4, 5) ~ "College",
+      TRUE ~ NA_character_
+    ),
+    Gender = dplyr::case_when(
+      is.na(.data$RAGENDER) ~ NA_character_,
+      .data$RAGENDER == 1 ~ "Male",
+      .data$RAGENDER == 2 ~ "Female",
+      TRUE ~ NA_character_
+    ),
+    APOE4_carrier = dplyr::case_when(
+      is.na(.data$APOE4) ~ NA_character_,
+      .data$APOE4 == 0 ~ "No",
+      .data$APOE4 %in% c(1, 2) ~ "Yes",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+# Filter
+
+```{r filter}
+merge_df <- merge_df %>%
+  # Filter to NHW MCI
+  dplyr::filter(
+    !is.na(.data$RAHISPAN),
+    .data$RAHISPAN == 0,
+    !is.na(.data$RARACEM),
+    .data$RARACEM == 1,
+    !is.na(.data$VS1HCAPDX_EAP),
+    # EAP is 1 = Cognitive Normal, 2 = Mild Cognitive Impairment, 3 = Dementia
+    .data$VS1HCAPDX_EAP == 2
+  ) %>%
+  # Filter to having DNAm data
+  dplyr::filter(
+    !is.na(.data$SubjectID_Submitter),
+    .data$SubjectID_Submitter %in% smoke_df$SubjectID_Submitter
+  ) %>%
+  # Filter to having age, sex, pTau, vs4mem_eap, and APOE4
+  dplyr::filter(
+    !is.na(.data$Age),
+    !is.na(.data$Gender),
+    !is.na(.data$PPTAU181),
+    !is.na(.data$VS4MEM_EAP),
+    !is.na(.data$APOE4)
+  ) %>%
+  dplyr::select(
+    "HHID",
+    "PN",
+    "SubjectID_Submitter",
+    "Gender",
+    "Age",
+    "time",
+    Education = "RAEDYRS",
+    "Education_category",
+    "APOE4_carrier",
+    "APOE4",
+    "Smoking",
+    "Smoking_Predicted",
+    "Smoking_Class",
+    "Smoking_Binary",
+    "Smoking_Score",
+    "Smoking_Current",
+    "Smoking_Former",
+    "Smoking_Never",
+    "Smoking_Imputed",
+    "prop_GR",
+    "prop_NK",
+    "prop_B",
+    "prop_CD4",
+    "prop_CD8",
+    "prop_MO",
+    "PAB42_40_RATIO",
+    "PPTAU181",
+    "PGFAP",
+    "PNFL",
+    "LOG_AB42_40_RATIO",
+    "LOG_PTAU181",
+    "LOG_GFAP",
+    "LOG_NFL",
+    "VS4MEM_EAP",
+    "VS4MEM_PV",
+    "SUT_MEM_16",
+    "SUT_MEM_22",
+    "SUT_MEM_CERAD3_16",
+    "SUT_MEM_CERAD3_22",
+    "SUT_MEM_ALL8_16",
+    "SUT_MEM_ALL8_22",
+    "OSHEA_MEM_16",
+    "OSHEA_MEM_22",
+    "OSHEA_MEM_ALL6_16",
+    "OSHEA_MEM_ALL6_22",
+    "SUT_MEM_COUNT_16",
+    "SUT_MEM_COUNT_22",
+    "SUT_MEM_CERAD3_COUNT_16",
+    "SUT_MEM_CERAD3_COUNT_22",
+    "OSHEA_MEM_COUNT_16",
+    "OSHEA_MEM_COUNT_22",
+    "SUTIN_CERAD_BOTH_WAVES",
+    "SUTIN_ALL8_BOTH_WAVES",
+    "OSHEA_ALL6_BOTH_WAVES",
+    "VS2MEMIMP_EAP"
+  )
+```
+
+# Calculate Scaled Biomarkers
+
+```{r scale_bio}
+merge_df <- merge_df %>%
+  dplyr::mutate(
+    Z_AB42_PATHOLOGY = -as.numeric(scale(.data$LOG_AB42_40_RATIO)),
+    Z_PTAU181 = as.numeric(scale(.data$LOG_PTAU181)),
+    Z_GFAP = as.numeric(scale(.data$LOG_GFAP)),
+    Z_NFL = as.numeric(scale(.data$LOG_NFL))
+  )
+```
+
+# Save
+
+```{r save}
+write.csv(
+  merge_df,
+  file = file.path(data_dir, "NHW_HCAP_MCI.csv"),
+  row.names = FALSE
+)
+```
+
+# Save Longitudinal
+
+```{r save_long}
+# Save the subjects whose `both_waves_flag` column is TRUE
+write_longitudinal <- function(long_df, both_waves_flag, file_name) {
+  write.csv(
+    long_df %>%
+      dplyr::filter(.data[[both_waves_flag]]),
+    file = file.path(data_dir, file_name),
+    row.names = FALSE
+  )
+}
+
+long_df <- merge_df %>%
+  dplyr::filter(!is.na(.data$time), .data$time > 0)
+
+write_longitudinal(
+  long_df, "SUTIN_ALL8_BOTH_WAVES", "NHW_HCAP_Longitudinal_Sutin.csv"
+)
+write_longitudinal(
+  long_df, "SUTIN_CERAD_BOTH_WAVES", "NHW_HCAP_Longitudinal_Cerad.csv"
+)
+write_longitudinal(
+  long_df, "OSHEA_ALL6_BOTH_WAVES", "NHW_HCAP_Longitudinal_Oshea.csv"
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

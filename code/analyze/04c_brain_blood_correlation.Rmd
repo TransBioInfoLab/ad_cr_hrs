@@ -1,0 +1,386 @@
+---
+title: "Evaluate correlation between brain and blood samples of significant CpGs and DMR regions using the LONDON dataset"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(plyr)
+  library(dplyr)
+  library(doParallel)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION", "data")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results")
+
+london_dir <- file.path(base_dir, "DATASET", "LONDON")
+pheno_dir <- file.path(london_dir, "Phenotype", "processed")
+beta_dir <- file.path(london_dir, "DNAm", "pca_filtering")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "annotation_functions.R"))
+```
+
+# Define Functions
+
+## Calculate Residuals
+
+```{r func_resid}
+brain_lmF <- function(mval, pheno_df) {
+  fitE <- stats::lm(
+    mval ~ brain_age + sex + neuron_prop + brain_slide,
+    data = pheno_df,
+    na.action = na.exclude
+  )
+
+  stats::residuals(fitE)
+}
+
+blood_lmF <- function(mval, pheno_df) {
+  fitE <- stats::lm(
+    mval ~ blood_age + sex + blood_slide + B + NK + CD4T + Mono + Gran,
+    data = pheno_df,
+    na.action = na.exclude
+  )
+
+  stats::residuals(fitE)
+}
+
+calculate_residuals <- function(
+    beta_mat, pheno_df, source = c("brain", "blood")
+) {
+  source <- match.arg(source)
+
+  if (source == "brain") {
+    func_lmf <- brain_lmF
+  } else {
+    func_lmf <- blood_lmF
+  }
+
+  mval_mat <- log2(beta_mat / (1 - beta_mat))
+
+  doParallel::registerDoParallel(8)
+  resid_df <- plyr::adply(
+    mval_mat,
+    1,
+    .fun = function(mval) {
+      func_lmf(mval, pheno_df)
+    },
+    .progress = "time",
+    .parallel = TRUE
+  )
+  doParallel::stopImplicitCluster()
+
+  resid_df <- resid_df %>%
+    tibble::column_to_rownames("X1")
+  colnames(resid_df) <- colnames(beta_mat)
+  resid_mat <- as.matrix(resid_df)
+
+  resid_mat
+}
+```
+
+## Calculate Correlations
+
+```{r func_corr}
+get_corr_vals <- function(mat_x, mat_y) {
+  corr_vals <- plyr::adply(
+    seq_len(nrow(mat_x)),
+    .margins = 1,
+    .fun = function(row) {
+      spearman_cor <- cor.test(
+        mat_x[row, ], mat_y[row, ], method = "spearman"
+      )
+
+      data.frame(
+        spearman_cor = spearman_cor$estimate,
+        pvalue = spearman_cor$p.value,
+        stringsAsFactors = FALSE
+      )
+    }, .id = NULL
+  )
+
+  corr_vals <- corr_vals %>%
+    dplyr::mutate(cpg = row.names(mat_x), .before = "spearman_cor") %>%
+    dplyr::mutate(fdr = p.adjust(.data$pvalue, method = "fdr"))
+
+  corr_vals
+}
+
+calculate_correlations <- function(
+    brain_beta_mat, blood_beta_mat, brain_resid_mat, blood_resid_mat
+) {
+  beta_df <- get_corr_vals(brain_beta_mat, blood_beta_mat) %>%
+    dplyr::rename(
+      beta_spearman = "spearman_cor",
+      beta_pvalue = "pvalue",
+      beta_fdr = "fdr"
+    )
+
+  resid_df <- get_corr_vals(brain_resid_mat, blood_resid_mat) %>%
+    dplyr::rename(
+      resid_spearman = "spearman_cor",
+      resid_pvalue = "pvalue",
+      resid_fdr = "fdr"
+    )
+
+  beta_df %>%
+    dplyr::inner_join(resid_df, by = "cpg")
+}
+```
+
+## Load Significant Genes
+
+```{r func_load_signif}
+read_signifs <- function() {
+  # get CpG annotation information
+  save_name <- file.path(
+    save_dir,
+    "linear_model",
+    "EAP_stats_bacon_interact.csv"
+  )
+  stats_df <- read.csv(file = save_name) %>%
+    dplyr::mutate(direction = ifelse(.data$estimate_bacon > 0, "+", "-")) %>%
+    dplyr::select(
+      cpg = "CpG",
+      "Chr",
+      "Position",
+      "UCSC_RefGene_Name",
+      "UCSC_RefGene_Group",
+      "Relation_to_Island",
+      "GREAT_annotation",
+      estimate = "estimate_bacon",
+      stdErr = "std_error_bacon",
+      pvalue = "pvalue_bacon",
+      "direction",
+      fdr = "fdr_bacon"
+    )
+
+  # get list of significant CpGs
+  sig_df <- read.csv(file.path(
+    save_dir,
+    "comb-p-DMRs",
+    "interact_mQTLs_inputs.csv"
+  )) %>%
+    dplyr::rename(cpg = "cpgs") %>%
+    dplyr::left_join(stats_df, by = "cpg") %>%
+    dplyr::mutate(
+      UCSC_RefGene_Name = filter_column(.data$UCSC_RefGene_Name),
+      UCSC_RefGene_Group = filter_column(.data$UCSC_RefGene_Group),
+      Relation_to_Island = filter_column(.data$Relation_to_Island),
+      GREAT_annotation = filter_column(.data$GREAT_annotation)
+    )
+
+  sig_df
+}
+```
+
+## Load London Data
+
+```{r func_load_london}
+read_london_pheno <- function() {
+  brain_pheno_df <- readRDS(
+    file.path(pheno_dir, "pheno107_PFC_withNeuronProp_withStageExclude_df.RDS")
+  ) %>%
+    dplyr::select(
+      brain_sample = "sample",
+      subject_id = "subject.id",
+      brain_age = "age.brain",
+      "sex",
+      brain_slide = "slide",
+      neuron_prop = "prop.neuron"
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(c("subject_id", "sex", "brain_slide"), as.character),
+      dplyr::across(c("brain_age", "neuron_prop"), as.numeric)
+    )
+  blood_pheno_df <- readRDS(
+    file.path(pheno_dir, "pheno_BLOOD_withBloodProp_withStatusExclude_df.rds")
+  ) %>%
+    dplyr::select(
+      blood_sample = "sample",
+      subject_id = "subject.id",
+      blood_age = "age.blood",
+      "sex",
+      blood_slide = "slide",
+      "B",
+      "NK",
+      "CD4T",
+      "CD8T",
+      "Mono",
+      "Neutro",
+      "Eosino"
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(c("subject_id", "sex", "blood_slide"), as.character),
+      dplyr::across(
+        c("blood_age", "B", "NK", "CD4T", "CD8T", "Mono", "Neutro", "Eosino"),
+        as.numeric
+      )
+    ) %>%
+    dplyr::mutate(
+      Gran = .data$Neutro + .data$Eosino
+    )
+
+  pheno_df <- brain_pheno_df %>%
+    dplyr::select(-"sex") %>%
+    dplyr::inner_join(blood_pheno_df, by = "subject_id")
+
+  pheno_df
+}
+
+read_london_beta <- function() {
+  brain_beta_mat <- readRDS(
+    file.path(
+      beta_dir, "BRAIN", "London_PFC_QNBMIQ_PCfiltered_withStageExclude.RDS"
+    )
+  )
+
+  blood_beta_mat <- readRDS(
+    file.path(
+      beta_dir, "BLOOD", "London_QNBMIQ_PCfiltered_withStatusExclude.RDS"
+    )
+  )
+
+  cpgs <- intersect(row.names(brain_beta_mat), row.names(blood_beta_mat))
+  brain_beta_mat <- brain_beta_mat[cpgs, ]
+  blood_beta_mat <- blood_beta_mat[cpgs, ]
+
+  list(brain = brain_beta_mat, blood = blood_beta_mat)
+}
+
+read_london <- function() {
+  pheno_df <- read_london_pheno()
+  beta_ls <- read_london_beta()
+  brain_beta_mat <- beta_ls$brain
+  blood_beta_mat <- beta_ls$blood
+
+  brain_beta_mat <- brain_beta_mat[, pheno_df$brain_sample]
+  blood_beta_mat <- blood_beta_mat[, pheno_df$blood_sample]
+
+  list(pheno_df = pheno_df, brain = brain_beta_mat, blood = blood_beta_mat)
+}
+```
+
+## Save Functions
+
+```{r func_save}
+save_results <- function(corr_df) {
+  write.csv(
+    corr_df,
+    file = file.path(
+      save_dir,
+      "eQTM_probes",
+      "London_Brain_Blood_Correlation_CpGs.csv"
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+## Wrapper Functions
+
+```{r func_wrapper}
+get_london_data <- function(cpg_df) {
+  london_ls <- read_london()
+
+  pheno_df <- london_ls$pheno_df
+  brain_beta_mat <- london_ls$brain
+  blood_beta_mat <- london_ls$blood
+
+  cpgs <- cpg_df$cpg
+  cpgs <- cpgs[cpgs %in% row.names(brain_beta_mat)]
+
+  brain_beta_mat <- brain_beta_mat[cpgs, ]
+  blood_beta_mat <- blood_beta_mat[cpgs, ]
+
+  brain_resid <- calculate_residuals(brain_beta_mat, pheno_df, source = "brain")
+  blood_resid <- calculate_residuals(blood_beta_mat, pheno_df, source = "blood")
+
+  list(
+    brain_mat = brain_beta_mat,
+    brain_resid = brain_resid,
+    blood_mat = blood_beta_mat,
+    blood_resid = blood_resid
+  )
+}
+
+wrapper_add_annotations <- function(corr_df, cpg_df) {
+  becon_df <- read.csv(file.path(reference_dir, "BECon_Data.csv")) %>%
+    dplyr::select(cpg = "CpG.ID", BA10 = "Cor.Blood..BA10")
+
+  corr_df <- corr_df %>%
+    dplyr::left_join(becon_df, by = "cpg") %>%
+    dplyr::left_join(cpg_df, by = "cpg")
+
+  corr_df
+}
+
+wrapper_analysis <- function() {
+  cpg_df <- read_signifs()
+  london_ls <- get_london_data(cpg_df)
+
+  brain_beta_mat <- london_ls$brain_mat
+  blood_beta_mat <- london_ls$blood_mat
+  brain_resid <- london_ls$brain_resid
+  blood_resid <- london_ls$blood_resid
+  cpgs <- row.names(brain_beta_mat)
+  cpg_df <- cpg_df[match(cpgs, cpg_df$cpg), ]
+
+  corr_df <- calculate_correlations(
+    brain_beta_mat, blood_beta_mat, brain_resid, blood_resid
+  )
+
+  corr_df <- wrapper_add_annotations(corr_df, cpg_df)
+
+  save_results(corr_df)
+}
+```
+
+# Run Analysis
+
+## Analyze
+
+```{r analyze}
+wrapper_analysis()
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

@@ -1,0 +1,78 @@
+---
+title: "Generate a Table of Longitudinal Subject Characteristics"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "characteristics_functions.R"))
+```
+
+# Get Table
+
+## Load Phenotypes
+
+```{r load}
+pheno_df <- read_hrs_characteristics(data_dir, longitudinal = TRUE)
+```
+
+## Compile Statistics
+
+```{r stats}
+characteristic_types <- c(
+  Age = "numeric",
+  Gender = "categoric",
+  APOE4_carrier = "categoric",
+  Education = "numeric",
+  Smoking = "categoric",
+  PPTAU181 = "numeric"
+)
+
+res_df <- summarize_characteristics(pheno_df, characteristic_types)
+
+res_df
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

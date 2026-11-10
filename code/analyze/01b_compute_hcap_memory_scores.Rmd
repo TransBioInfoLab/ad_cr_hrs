@@ -1,0 +1,805 @@
+---
+title: "Compute HCAP memory scores and sensitivity scores"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(haven)
+  library(dplyr)
+  library(tibble)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+hrs_dir <- file.path(base_dir, "DATASET", "HRS", "Phenotype")
+data_dir <- file.path(analysis_dir, "data")
+
+stopifnot(dir.exists(hrs_dir))
+
+if (!dir.exists(data_dir)) dir.create(data_dir, recursive = TRUE)
+```
+
+# Define Functions
+
+## Get Data
+
+```{r func_load}
+# Stop with `message` followed by the listed values, if there are any
+stop_if_any <- function(values, message, suffix = "") {
+  if (length(values) > 0) {
+    stop(message, paste(values, collapse = ", "), suffix)
+  }
+}
+
+get_hcap_data <- function(version = c("16", "22")) {
+  version <- as.character(version)
+  version <- match.arg(version)
+  hcap_dir <- file.path(hrs_dir, "HCAP", paste0("HC", version))
+  hcap_file_dta <- file.path(hcap_dir, paste0("hc", version, "hp_r.dta"))
+  hcap_file_sas <- file.path(hcap_dir, paste0("hc", version, "hp_r.sas7bdat"))
+
+  if (file.exists(hcap_file_dta)) {
+    hcap <- haven::read_dta(hcap_file_dta)
+  } else if (file.exists(hcap_file_sas)) {
+    hcap <- haven::read_sas(hcap_file_sas)
+  } else {
+    stop(
+      "Could not find hc", version, "hp_r.dta",
+      " or hc", version, "hp_r.sas7bdat in: ",
+      hcap_dir
+    )
+  }
+
+  names(hcap) <- toupper(names(hcap))
+
+  hcap
+}
+
+get_memory_variables <- function(hcap, has_imp = TRUE, test_num = c("R1", "R2")) {
+  test_num <- match.arg(test_num)
+  score_names <- c(
+    "WORD1_SCORE",
+    "WORD_DSCORE",
+    "WREC_ORG",
+    "BM_IMMSCORE",
+    "BM_DELSCORE",
+    "LMB_IMMSCORE",
+    "LMB_DELSCORE",
+    "LMB_RECOSCORE"
+  )
+  memory_var_df <- tibble::tribble(
+    ~score_name,                ~expected_min, ~expected_max,
+    "cerad_immediate_trial1",   0,             10,
+    "cerad_delayed",            0,             10,
+    "cerad_recognition",        0,             10,
+    "brave_immediate",          0,             12,
+    "brave_delayed",            0,             12,
+    "logical_immediate",        0,             23,
+    "logical_delayed",          0,             25,
+    "logical_recognition",      0,             15
+  )
+  memory_var_df$hcap_var <- paste0(test_num, score_names)
+  needed_vars <- memory_var_df$hcap_var
+
+  if (has_imp) {
+    memory_var_df$imp_flag <- paste0(test_num, "F", score_names)
+    needed_vars <- c(needed_vars, memory_var_df$imp_flag)
+  } else {
+    memory_var_df$imp_flag <- NA_character_
+  }
+
+  stop_if_any(
+    setdiff(needed_vars, names(hcap)),
+    "These expected variables are missing from HC data: "
+  )
+
+  memory_var_df
+}
+
+get_oshea_memory_variables <- function(
+    hcap, has_imp = TRUE, test_num = c("R1", "R2")
+) {
+  test_num <- match.arg(test_num)
+  score_names <- c(
+    "WORD_DSCORE",
+    "LMB_DELSCORE",
+    "DLRC3",
+    "CPDEL_SCORE",
+    "BM_DELSCORE",
+    "WLREC_TOTSCORE"
+  )
+
+  oshea_var_df <- tibble::tibble(
+    component_name = c(
+      "oshea_word_delayed",
+      "oshea_logical_delayed",
+      "oshea_three_word_delayed",
+      "oshea_complex_praxis_delayed",
+      "oshea_brave_delayed",
+      "oshea_wordlist_recognition"
+    ),
+    hcap_var = paste0(test_num, score_names),
+    # Delayed three-word recall (DLRC3) has no imputation flag in HC16.
+    imp_flag_suffix = c(
+      "FWORD_DSCORE",
+      "FLMB_DELSCORE",
+      NA_character_,
+      "FCPDEL_SCORE",
+      "FBM_DELSCORE",
+      "FWLREC_TOTSCORE"
+    )
+  )
+
+  needed_vars <- oshea_var_df$hcap_var
+
+  if (has_imp) {
+    oshea_var_df$imp_flag <- ifelse(
+      is.na(oshea_var_df$imp_flag_suffix),
+      NA_character_,
+      paste0(test_num, oshea_var_df$imp_flag_suffix)
+    )
+    needed_vars <- c(needed_vars, stats::na.omit(oshea_var_df$imp_flag))
+  } else {
+    oshea_var_df$imp_flag <- NA_character_
+  }
+
+  oshea_var_df$imp_flag_suffix <- NULL
+
+  stop_if_any(
+    setdiff(needed_vars, names(hcap)),
+    "These expected O'Shea variables are missing from HC data: "
+  )
+
+  oshea_var_df
+}
+```
+
+## Get Memory Score
+
+```{r func_mem_score}
+clean_score <- function(x) {
+  hcap_missing_codes <- c(96, 97, 98, 99, 996, 997, 998, 999)
+
+  x <- haven::zap_missing(x)
+  x <- haven::zap_labels(x)
+  x <- as.numeric(x)
+
+  x[x %in% hcap_missing_codes] <- NA_real_
+
+  x
+}
+
+# Set scores whose imputation flag is 1 to missing
+drop_imputed_scores <- function(score, flag) {
+  flag <- clean_score(flag)
+  ifelse(!is.na(flag) & flag == 1, NA_real_, score)
+}
+
+extract_oshea_scores <- function(
+    hcap, oshea_var_df, use_imputed_scores = TRUE
+) {
+  oshea_raw <- hcap %>%
+    dplyr::select(
+      "HHID",
+      "PN",
+      dplyr::all_of(oshea_var_df$hcap_var),
+      dplyr::all_of(stats::na.omit(oshea_var_df$imp_flag))
+    )
+
+  for (i in seq_len(nrow(oshea_var_df))) {
+    old <- oshea_var_df$hcap_var[i]
+    new <- oshea_var_df$component_name[i]
+    oshea_raw[[new]] <- clean_score(oshea_raw[[old]])
+
+    # Apply the same imputation rule used for the Sutin components.
+    if (!use_imputed_scores && !is.na(oshea_var_df$imp_flag[i])) {
+      oshea_raw[[new]] <- drop_imputed_scores(
+        oshea_raw[[new]], oshea_raw[[oshea_var_df$imp_flag[i]]]
+      )
+    }
+  }
+
+  # Match the published O'Shea recoding used in the original program.
+  oshea_raw$oshea_three_word_delayed <- dplyr::case_when(
+    oshea_raw$oshea_three_word_delayed <= 1 ~ 0,
+    oshea_raw$oshea_three_word_delayed == 2 ~ 1,
+    oshea_raw$oshea_three_word_delayed == 3 ~ 2,
+    TRUE ~ NA_real_
+  )
+
+  oshea_raw %>%
+    dplyr::select(
+      "HHID",
+      "PN",
+      dplyr::all_of(oshea_var_df$component_name)
+    )
+}
+
+extract_memory_score <- function(hcap, memory_var_df) {
+  memory_raw <- hcap %>%
+    dplyr::select(
+      "HHID",
+      "PN",
+      dplyr::all_of(memory_var_df$hcap_var),
+      dplyr::all_of(stats::na.omit(memory_var_df$imp_flag))
+    )
+
+  ## Rename HCAP score variables to readable names
+  for (i in seq_len(nrow(memory_var_df))) {
+    old <- memory_var_df$hcap_var[i]
+    new <- memory_var_df$score_name[i]
+    memory_raw[[new]] <- clean_score(memory_raw[[old]])
+  }
+
+  memory_raw
+}
+
+check_imputed_scores <- function(
+    memory_raw, memory_var_df, use_imputed_scores = TRUE
+) {
+  if (!use_imputed_scores) {
+    for (i in seq_len(nrow(memory_var_df))) {
+      score_name <- memory_var_df$score_name[i]
+      flag_var <- memory_var_df$imp_flag[i]
+
+      if (!is.na(flag_var)) {
+        memory_raw[[score_name]] <- drop_imputed_scores(
+          memory_raw[[score_name]], memory_raw[[flag_var]]
+        )
+      }
+    }
+  }
+
+  ## Keep only ID + readable memory task variables
+  memory_raw <- memory_raw %>%
+    dplyr::select("HHID", "PN", dplyr::all_of(memory_var_df$score_name))
+
+  memory_raw
+}
+
+get_memory_scores <- function(hcap, memory_var_df, use_imputed_scores = TRUE) {
+  memory_raw <- extract_memory_score(hcap, memory_var_df)
+  memory_raw <- check_imputed_scores(
+    memory_raw, memory_var_df, use_imputed_scores = use_imputed_scores
+  )
+
+  memory_raw
+}
+
+check_memory_ranges <- function(memory_var_df, memory_raw) {
+  range_check <- memory_var_df %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(
+      n_nonmissing = sum(!is.na(memory_raw[[score_name]])),
+      n_missing = sum(is.na(memory_raw[[score_name]])),
+      observed_min = suppressWarnings(min(memory_raw[[score_name]], na.rm = TRUE)),
+      observed_max = suppressWarnings(max(memory_raw[[score_name]], na.rm = TRUE)),
+      n_out_of_range = sum(
+        !is.na(memory_raw[[score_name]]) &
+          (memory_raw[[score_name]] < expected_min |
+             memory_raw[[score_name]] > expected_max)
+      )
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(
+      "score_name",
+      "hcap_var",
+      "expected_min",
+      "expected_max",
+      "observed_min",
+      "observed_max",
+      "n_nonmissing",
+      "n_missing",
+      "n_out_of_range"
+    )
+
+  range_check
+}
+
+stop_if_out_of_range <- function(range_check) {
+  stop_if_any(
+    range_check$score_name[range_check$n_out_of_range > 0],
+    "The scores ",
+    " had values outside of the expected range."
+  )
+}
+```
+
+## Compute Composite Score
+
+```{r func_composite}
+get_oshea_ref <- function(oshea_raw, oshea_var_df) {
+  component_vars <- oshea_var_df$component_name
+
+  ref_df <- tibble::tibble(
+    component_name = component_vars,
+    sample_size = colSums(!is.na(oshea_raw[, component_vars])),
+    mean_ref = colMeans(oshea_raw[, component_vars], na.rm = TRUE),
+    sd_ref = apply(oshea_raw[, component_vars], 2, stats::sd, na.rm = TRUE)
+  )
+
+  ref_df
+}
+
+validate_oshea_ref <- function(reference_oshea, oshea_var_df) {
+  stop_if_any(
+    setdiff(c("component_name", "mean_ref", "sd_ref"), names(reference_oshea)),
+    "`reference_oshea` is missing column(s): "
+  )
+
+  dupes <- reference_oshea$component_name[
+    duplicated(reference_oshea$component_name)
+  ]
+  stop_if_any(
+    unique(dupes),
+    "`reference_oshea` has duplicated component_name(s): "
+  )
+
+  stop_if_any(
+    setdiff(oshea_var_df$component_name, reference_oshea$component_name),
+    "`reference_oshea` has no mean/SD for: "
+  )
+
+  ref_used <- reference_oshea[
+    match(oshea_var_df$component_name, reference_oshea$component_name),
+    ,
+    drop = FALSE
+  ]
+  stop_if_any(
+    ref_used$component_name[is.na(ref_used$sd_ref) | ref_used$sd_ref <= 0],
+    "`reference_oshea` has a missing or non-positive SD for: "
+  )
+
+  invisible(reference_oshea)
+}
+
+standardize_oshea <- function(
+    oshea_raw,
+    ref_df,
+    oshea_var_df,
+    min_tasks_required = 5
+) {
+  component_vars <- oshea_var_df$component_name
+  ref_used <- ref_df[
+    match(component_vars, ref_df$component_name),
+    ,
+    drop = FALSE
+  ]
+
+  oshea_scaled <- oshea_raw[, component_vars]
+  oshea_scaled <- sweep(oshea_scaled, 2, ref_used$mean_ref, FUN = "-")
+  oshea_scaled <- sweep(oshea_scaled, 2, ref_used$sd_ref, FUN = "/")
+
+  z_vars <- paste0(component_vars, "_z")
+  colnames(oshea_scaled) <- z_vars
+
+  oshea_scores <- dplyr::bind_cols(oshea_raw, oshea_scaled) %>%
+    dplyr::mutate(
+      n_oshea_items = rowSums(
+        !is.na(dplyr::across(dplyr::all_of(z_vars)))
+      ),
+      .oshea_mean = rowMeans(
+        dplyr::across(dplyr::all_of(z_vars)),
+        na.rm = TRUE
+      ),
+      OSHEA_MEM = dplyr::if_else(
+        .data$n_oshea_items >= min_tasks_required,
+        .data$.oshea_mean,
+        NA_real_
+      ),
+      OSHEA_MEM_ALL6 = dplyr::if_else(
+        .data$n_oshea_items == length(z_vars),
+        .data$.oshea_mean,
+        NA_real_
+      )
+    ) %>%
+    dplyr::select(-".oshea_mean")
+
+  oshea_scores
+}
+
+get_memory_dist <- function(memory_raw, memory_var_df) {
+  memory_stat_df <- memory_raw %>%
+    dplyr::summarise(
+      dplyr::across(
+        dplyr::all_of(memory_var_df$score_name),
+        list(
+          sample_size = ~sum(!is.na(.x)),
+          ave = ~mean(.x, na.rm = TRUE),
+          std = ~sd(.x, na.rm = TRUE)
+        )
+      )
+    ) %>%
+    tidyr::pivot_longer(
+      dplyr::everything(),
+      names_to = c("score_name", ".value"),
+      names_sep = "_(?=sample_size$|ave$|std$)"
+    )
+
+  memory_stat_df
+}
+
+standardize_memory <- function(memory_raw, memory_var_df, memory_stat_df) {
+  memory_z <- memory_raw %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::all_of(memory_var_df$score_name),
+        function(x) {
+          idx <- match(dplyr::cur_column(), memory_stat_df$score_name)
+          (x - memory_stat_df$ave[idx]) / memory_stat_df$std[idx]
+        },
+        .names = "{.col}_z"
+      )
+    )
+
+  memory_z
+}
+
+compute_composite_scores <- function(
+    memory_z, memory_var_df, min_tasks_required = 7
+) {
+  z_vars <- paste0(memory_var_df$score_name, "_z")
+  cerad_z_vars <- paste0(
+    memory_var_df$score_name[grepl("^cerad_", memory_var_df$score_name)],
+    "_z"
+  )
+
+  memory_scores <- memory_z %>%
+    dplyr::mutate(
+      n_memory_tasks = rowSums(
+        !is.na(dplyr::across(dplyr::all_of(z_vars)))
+      ),
+      n_cerad_tasks = rowSums(
+        !is.na(dplyr::across(dplyr::all_of(cerad_z_vars)))
+      ),
+      .sutin_mean = base::rowMeans(
+        dplyr::across(dplyr::all_of(z_vars)),
+        na.rm = TRUE
+      ),
+      SUT_MEM = dplyr::if_else(
+        .data$n_memory_tasks >= min_tasks_required,
+        .data$.sutin_mean,
+        NA_real_
+      ),
+      SUT_MEM_ALL8 = dplyr::if_else(
+        .data$n_memory_tasks == length(z_vars),
+        .data$.sutin_mean,
+        NA_real_
+      ),
+      .cerad_mean = base::rowMeans(
+        dplyr::across(dplyr::all_of(cerad_z_vars)),
+        na.rm = TRUE
+      ),
+      # CERAD-only sensitivity score avoids tests whose administration mode
+      # differed between the two HCAP waves. Require all three CERAD tasks.
+      SUT_MEM_CERAD3 = dplyr::if_else(
+        .data$n_cerad_tasks == length(cerad_z_vars),
+        .data$.cerad_mean,
+        NA_real_
+      )
+    ) %>%
+    dplyr::select(
+      "HHID",
+      "PN",
+      dplyr::all_of(memory_var_df$score_name),
+      dplyr::all_of(z_vars),
+      "n_memory_tasks",
+      "n_cerad_tasks",
+      "SUT_MEM",
+      "SUT_MEM_ALL8",
+      "SUT_MEM_CERAD3"
+    )
+
+  memory_scores
+}
+
+add_composite_scores <- function(
+    hcap, memory_var_df, memory_raw, memory_stat_df, min_tasks_required = 7
+) {
+  memory_z <- standardize_memory(memory_raw, memory_var_df, memory_stat_df)
+  memory_scores <- compute_composite_scores(
+    memory_z, memory_var_df, min_tasks_required = min_tasks_required
+  )
+
+  hcap <- hcap %>%
+    dplyr::left_join(
+      memory_scores,
+      by = c("HHID", "PN"),
+      relationship = "one-to-one",
+      na_matches = "never"
+    )
+
+  hcap
+}
+```
+
+## Wrapper Function
+
+```{r func_wrapper}
+validate_reference_stats <- function(reference_stats, memory_var_df) {
+  stop_if_any(
+    setdiff(c("score_name", "ave", "std"), names(reference_stats)),
+    "`reference_stats` is missing column(s): "
+  )
+
+  dupes <- reference_stats$score_name[duplicated(reference_stats$score_name)]
+  stop_if_any(
+    unique(dupes),
+    "`reference_stats` has duplicated score_name(s): ",
+    ". `match()` would silently use only the first."
+  )
+
+  stop_if_any(
+    setdiff(memory_var_df$score_name, reference_stats$score_name),
+    "`reference_stats` has no mean/SD for: ",
+    ". Standardization would silently return NA for these tasks."
+  )
+
+  ref_used <- reference_stats[
+    reference_stats$score_name %in% memory_var_df$score_name,
+    ,
+    drop = FALSE
+  ]
+  stop_if_any(
+    ref_used$score_name[is.na(ref_used$std) | ref_used$std <= 0],
+    "`reference_stats` has a missing or non-positive SD for: "
+  )
+
+  invisible(reference_stats)
+}
+
+process_hcap_wave <- function(
+    version = c("16", "22"),
+    test_num = c("R1", "R2"),
+    has_imp = TRUE,
+    use_imputed_scores = TRUE,
+    reference_stats = NULL,
+    reference_oshea = NULL,
+    min_tasks_required = 7,
+    min_oshea_tasks_required = 5,
+    save_dir = "."
+) {
+  version <- as.character(version)
+  version <- match.arg(version)
+  test_num <- match.arg(test_num)
+
+  hcap <- get_hcap_data(version = version)
+
+  memory_var_df <- get_memory_variables(
+    hcap,
+    has_imp = has_imp,
+    test_num = test_num
+  )
+
+  memory_raw <- get_memory_scores(
+    hcap,
+    memory_var_df,
+    use_imputed_scores = use_imputed_scores
+  )
+
+  write.csv(
+    memory_raw,
+    file = file.path(save_dir, paste0("hc", version, "_memory.csv")),
+    row.names = FALSE
+  )
+
+  range_check <- check_memory_ranges(memory_var_df, memory_raw)
+
+  if (is.null(reference_stats)) {
+    memory_stat_df <- get_memory_dist(memory_raw, memory_var_df)
+    validate_reference_stats(memory_stat_df, memory_var_df)
+    reference_source <- "self"
+  } else {
+    validate_reference_stats(reference_stats, memory_var_df)
+    memory_stat_df <- reference_stats
+    reference_source <- "external"
+  }
+
+  hcap <- add_composite_scores(
+    hcap,
+    memory_var_df,
+    memory_raw,
+    memory_stat_df,
+    min_tasks_required = min_tasks_required
+  )
+
+  oshea_var_df <- get_oshea_memory_variables(
+    hcap,
+    has_imp = has_imp,
+    test_num = test_num
+  )
+  oshea_raw <- extract_oshea_scores(
+    hcap,
+    oshea_var_df,
+    use_imputed_scores = use_imputed_scores
+  )
+
+  if (is.null(reference_oshea)) {
+    oshea_stat_df <- get_oshea_ref(oshea_raw, oshea_var_df)
+    validate_oshea_ref(oshea_stat_df, oshea_var_df)
+    oshea_source <- "self"
+  } else {
+    validate_oshea_ref(reference_oshea, oshea_var_df)
+    oshea_stat_df <- reference_oshea
+    oshea_source <- "external"
+  }
+
+  oshea_scores <- standardize_oshea(
+    oshea_raw,
+    oshea_stat_df,
+    oshea_var_df,
+    min_tasks_required = min_oshea_tasks_required
+  )
+  hcap <- hcap %>%
+    dplyr::left_join(
+      oshea_scores,
+      by = c("HHID", "PN"),
+      relationship = "one-to-one",
+      na_matches = "never"
+    )
+
+  interview_year <- paste0(test_num, "IWYEAR")
+  interview_month <- paste0(test_num, "IWMONTH")
+  subject_score_vars <- c(
+    memory_var_df$score_name,
+    paste0(memory_var_df$score_name, "_z"),
+    "n_memory_tasks",
+    "n_cerad_tasks",
+    "SUT_MEM",
+    "SUT_MEM_ALL8",
+    "SUT_MEM_CERAD3",
+    oshea_var_df$component_name,
+    paste0(oshea_var_df$component_name, "_z"),
+    "n_oshea_items",
+    "OSHEA_MEM",
+    "OSHEA_MEM_ALL6"
+  )
+  subject_scores <- hcap %>%
+    dplyr::transmute(
+      HHID = .data$HHID,
+      PN = .data$PN,
+      INTERVIEW_YEAR = .data[[interview_year]],
+      INTERVIEW_MONTH = .data[[interview_month]],
+      dplyr::across(dplyr::all_of(subject_score_vars))
+    )
+
+  list(
+    hcap               = hcap,
+    memory_raw         = memory_raw,
+    memory_stat_df     = memory_stat_df,
+    memory_var_df      = memory_var_df,
+    oshea_stat_df      = oshea_stat_df,
+    oshea_var_df       = oshea_var_df,
+    oshea_raw          = oshea_raw,
+    subject_scores     = subject_scores,
+    range_check        = range_check,
+    reference_source   = reference_source,
+    oshea_source       = oshea_source,
+    has_imp            = has_imp,
+    use_imputed_scores = use_imputed_scores
+  )
+}
+```
+
+# Calculate HC16 Composite Score
+
+## Calculate
+
+```{r calc_hcap16}
+hc16 <- process_hcap_wave(
+  version = 16,
+  test_num = "R1",
+  has_imp = TRUE,
+  # HC22 has no imputed values. For the sake of consistency, we remove them
+  # from HC16 as well
+  use_imputed_scores = FALSE,
+  reference_stats = NULL,
+  reference_oshea = NULL,
+  min_tasks_required = 7,
+  min_oshea_tasks_required = 5,
+  save_dir = data_dir
+)
+```
+
+## Check Distributions
+
+```{r check_hcap16}
+hc16$range_check
+table(hc16$hcap$n_memory_tasks)
+table(hc16$hcap$n_oshea_items)
+
+stop_if_out_of_range(hc16$range_check)
+```
+
+## Save Memory Scaling Reference
+
+```{r save_ref}
+write.csv(
+  hc16$memory_stat_df,
+  file = file.path(data_dir, "hc16_reference_stats.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  hc16$oshea_stat_df,
+  file = file.path(data_dir, "hc16_oshea_reference_stats.csv"),
+  row.names = FALSE
+)
+```
+
+# Calculate HC22 Composite Score
+
+## Calculate
+
+```{r calc_hcap22}
+hc22 <- process_hcap_wave(
+  version = 22,
+  test_num = "R2",
+  has_imp = FALSE,
+  # HC22 has no imputation flags, so we don't use them.
+  use_imputed_scores = FALSE,
+  reference_stats = hc16$memory_stat_df,
+  reference_oshea = hc16$oshea_stat_df,
+  min_tasks_required = 7,
+  min_oshea_tasks_required = 5,
+  save_dir = data_dir
+)
+stopifnot(
+  hc22$reference_source == "external",
+  hc22$oshea_source == "external"
+)
+```
+
+## Check Distributions
+
+```{r check_hcap22}
+hc22$range_check
+table(hc22$hcap$n_memory_tasks)
+table(hc22$hcap$n_oshea_items)
+
+stop_if_out_of_range(hc22$range_check)
+```
+
+# Save
+
+```{r save}
+saveRDS(hc16, file = file.path(data_dir, "hc16_stats.RDS"))
+saveRDS(hc22, file = file.path(data_dir, "hc22_stats.RDS"))
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

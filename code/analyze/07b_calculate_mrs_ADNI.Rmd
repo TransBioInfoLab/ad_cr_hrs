@@ -1,0 +1,103 @@
+---
+title: "Compute MRS scores"
+subtitle: "In ADNI dataset"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(readr)
+  library(SummarizedExperiment)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+ad_dir <- file.path(base_dir, "AD_CR")
+stat_dir <- file.path(
+  ad_dir,
+  "analysis-results",
+  "only_amyloid_positive_2_stage_approach"
+)
+save_dir <- file.path(analysis_dir, "analysis-results")
+cohort_path <- file.path(save_dir, "ADNI", "ADNI_2025_MCI_future_data.rds")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "mrs_weights.R"))
+source(file.path(code_dir, "mrs_scoring.R"))
+```
+
+# Load Data
+
+```{r load}
+# Run 07a_gather_ADNI_data.Rmd first to lock the 2025 MCI sample set.
+adni_data <- readRDS(cohort_path)
+beta_data <- adni_data$beta_data
+pheno_df <- adni_data$pheno_df
+```
+
+# Analyze
+
+```{r run, fig.width = 8, fig.height = 6}
+run_mrs_analysis(
+  beta_data,
+  out_dir = file.path(save_dir, "ADNI"),
+  nonfinite_message =
+    "New MRS weights produced non-finite scores for selected 2025 samples."
+)
+```
+
+# Save to Phenotype
+
+```{r save}
+mrs_df <- read.csv(file.path(save_dir, "ADNI", "EAP_MRS_scores.csv"))
+pheno_df <- pheno_df %>%
+  dplyr::left_join(
+    mrs_df,
+    by = c("sample" = "sample_id"),
+    relationship = "one-to-one",
+    na_matches = "never"
+  )
+
+write.csv(
+  pheno_df,
+  file = file.path(save_dir, "ADNI", "pheno_data.csv"),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

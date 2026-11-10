@@ -1,0 +1,320 @@
+---
+title: "top DMRs with significant DNAm x pTau effect in MCI subjects"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(purrr)
+  library(readxl)
+  library(broom)
+  library(stringr)
+  library(ggplot2)
+  library(limma)
+  library(tibble)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION", "data")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results")
+```
+
+# Define Functions
+
+## Load Data
+
+```{r func_load}
+get_metadata <- function() {
+  pheno_df <- read.csv(file.path(save_dir, "linear_model", "Phenotypes.csv"))
+
+  pheno_df
+}
+
+get_beta <- function(pheno_df) {
+  # get beta values
+  dnam_data <- readRDS(
+    file.path(hrs_dir, "batch_corrected", "HRS_White_NHispanic_PCA.RDS")
+  )
+  beta_data <- SummarizedExperiment::assays(dnam_data)$dnam
+
+  # Filter to samples we used for analysis
+  idx <- match(pheno_df$SubjectID_Submitter, dnam_data$SubjectID_Submitter)
+  beta_data <- beta_data[, idx, drop = FALSE] * 100
+
+  beta_data
+}
+
+read_dmr_data <- function() {
+  dmr_df <- read.csv(file.path(save_dir, "comb-p-DMRs", "interact_DMRs.csv")) %>%
+    dplyr::select("DMR", cpg = "cpgs_in_region") %>%
+    tidyr::separate_rows("cpg", sep = ",")
+
+  dmr_df
+}
+
+get_dmr_scores <- function(beta_data) {
+  dmr_df <- read_dmr_data()
+  beta_data <- beta_data[dmr_df$cpg, ]
+
+  dmr_df <- limma::avereps(beta_data, ID = dmr_df$DMR)
+
+  dmr_df
+}
+
+get_data <- function() {
+  pheno_df <- get_metadata()
+
+  beta_data <- get_beta(pheno_df)
+  dmr_df <- get_dmr_scores(beta_data)
+
+  list(pheno_df = pheno_df, dmr_df = dmr_df)
+}
+```
+
+## Plot Data
+
+```{r func_plot}
+# Retain the styling and point-plus-linear-smoother layout of the original
+# CpG scatter plots, without correlation tests or statistical subtitles.
+plot_dmr_scatter <- function(pheno_df, dmr_values, dmr, outcome, title, y_label) {
+  plot_df <- data.frame(
+    dmr_value = as.numeric(dmr_values),
+    outcome_value = pheno_df[[outcome]]
+  )
+
+  cor2 <- suppressWarnings(
+    stats::cor.test(
+      plot_df$dmr_value,
+      plot_df$outcome_value,
+      method = "spearman",
+      use = "complete.obs"
+    )
+  )
+
+  ggplot2::ggplot(plot_df, ggplot2::aes(x = dmr_value, y = outcome_value)) +
+    ggplot2::geom_point(alpha = 0.6, na.rm = TRUE) +
+    ggplot2::geom_smooth(
+      method = "lm", formula = y ~ x, se = TRUE, na.rm = TRUE
+    ) +
+    ggplot2::labs(
+      title = title,
+      subtitle = paste0(
+        "DMR ", dmr, "\n",
+        "Spearman = ",
+        sprintf("%.2f", as.numeric(cor2$estimate)),
+        ", p = ",
+        formatC(cor2$p.value, format = "g", digits = 3)
+      ),
+      x = "DMR mean DNAm (beta, %)",
+      y = y_label
+    ) +
+    ggplot2::theme_classic(base_size = 11, base_family = "Helvetica") +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(size = 12, face = "bold", hjust = 0),
+      plot.subtitle = ggplot2::element_text(size = 10, hjust = 0),
+      axis.title.x = ggplot2::element_text(size = 11),
+      axis.title.y = ggplot2::element_text(size = 11),
+      axis.text.x = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 9),
+      plot.margin = ggplot2::margin(t = 5, r = 3, b = 5, l = 3, unit = "pt"),
+      plot.title.position = "panel"
+    )
+}
+
+save_dmr_pdf <- function(dmr_df, pheno_df) {
+  grDevices::pdf(
+    file.path(save_dir, "plots", "dmr_to_ptau_and_memory.pdf"),
+    width = 8.5, height = 11
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+
+  for (first in seq.int(1L, nrow(dmr_df), by = 2L)) {
+    plots <- list()
+    for (i in seq.int(first, min(first + 1L, nrow(dmr_df)))) {
+      dmr <- rownames(dmr_df)[i]
+      scores <- dmr_df[i, ]
+
+      # Left: residual cognition; right: pTau z-score, for the same DMR.
+      plots <- c(plots, list(
+        plot_dmr_scatter(
+          pheno_df, scores, dmr, "resid",
+          "Residual cognition vs DMR",
+          "Memory score (residual; covariate-adjusted)"
+        ),
+        plot_dmr_scatter(
+          pheno_df, scores, dmr, "Z_PTAU181",
+          "pTau vs DMR", "pTau (z-score)"
+        )
+      ))
+    }
+
+    # If the number of DMRs is odd, leave the final page's bottom row blank.
+    while (length(plots) < 4L) {
+      plots[[length(plots) + 1L]] <- grid::nullGrob()
+    }
+
+    page <- gridExtra::arrangeGrob(
+      grobs = plots,
+      layout_matrix = rbind(
+        c(NA, NA, NA, NA, NA),
+        c(NA,  1, NA,  2, NA),
+        c(NA,  3, NA,  4, NA),
+        c(NA, NA, NA, NA, NA)
+      ),
+      widths = grid::unit(c(0.45, 3.75, 0.10, 3.75, 0.45), "in"),
+      heights = grid::unit(c(0.8, 4.8, 4.8, 0.6), "in")
+    )
+    grid::grid.newpage()
+    grid::grid.draw(page)
+  }
+
+  invisible(NULL)
+}
+```
+
+## Correlation Tables
+
+```{r func_table}
+# Same Spearman tests as the scatter plots and as the CpG summaries in 05a
+spearman_summary <- function(dmr_values, outcome_values) {
+  keep <- stats::complete.cases(dmr_values, outcome_values)
+  test <- suppressWarnings(
+    stats::cor.test(
+      dmr_values, outcome_values, method = "spearman", use = "complete.obs"
+    )
+  )
+
+  list(
+    n = sum(keep),
+    rho = unname(as.numeric(test$estimate)),
+    p = test$p.value
+  )
+}
+
+get_dmr_correlations <- function(dmr_df, pheno_df) {
+  plyr::ldply(seq_len(nrow(dmr_df)), function(i) {
+    scores <- as.numeric(dmr_df[i, ])
+    mem <- spearman_summary(scores, pheno_df$resid)
+    ptau <- spearman_summary(scores, pheno_df$Z_PTAU181)
+
+    data.frame(
+      DMR = rownames(dmr_df)[i],
+      n_resid = mem$n,
+      spearman_rho_resid = mem$rho,
+      p_resid = mem$p,
+      n_pTau = ptau$n,
+      spearman_rho_pTau = ptau$rho,
+      p_pTau = ptau$p
+    )
+  })
+}
+
+# Stack the 05a CpG summaries and the DMR summaries, then apply BH FDR across
+# all loci (25 CpGs + 32 DMRs), separately for memory and for pTau.
+combine_and_correct <- function(dmr_cor_df) {
+  cpg_cor_df <- read.csv(
+    file.path(save_dir, "linear_model", "all_assoc_summaries_MCI.csv")
+  ) %>%
+    dplyr::select(
+      Locus = "CpG", "n_resid", "spearman_rho_resid", "p_resid",
+      "n_pTau", "spearman_rho_pTau", "p_pTau"
+    ) %>%
+    dplyr::mutate(Type = "CpG")
+
+  dmr_cor_df %>%
+    dplyr::rename(Locus = "DMR") %>%
+    dplyr::mutate(Type = "DMR") %>%
+    dplyr::bind_rows(cpg_cor_df, .) %>%
+    dplyr::relocate("Type", .after = "Locus") %>%
+    dplyr::mutate(
+      fdr_resid = stats::p.adjust(.data$p_resid, method = "BH"),
+      fdr_pTau = stats::p.adjust(.data$p_pTau, method = "BH")
+    ) %>%
+    dplyr::relocate("fdr_resid", .after = "p_resid")
+}
+```
+
+# Run Analysis
+
+## Load Data
+
+```{r load}
+data_ls <- get_data()
+
+pheno_df <- data_ls$pheno_df
+dmr_df <- data_ls$dmr_df
+```
+
+## Plot
+
+```{r plot}
+save_dmr_pdf(dmr_df, pheno_df)
+```
+
+## Save Correlation Tables
+
+```{r save_tables}
+dmr_cor_df <- get_dmr_correlations(dmr_df, pheno_df)
+write.csv(
+  dmr_cor_df,
+  file = file.path(save_dir, "linear_model", "all_assoc_summaries_DMR_MCI.csv"),
+  row.names = FALSE
+)
+
+locus_cor_df <- combine_and_correct(dmr_cor_df)
+cat(
+  "Loci in FDR family:", nrow(locus_cor_df),
+  "(", sum(locus_cor_df$Type == "CpG"), "CpGs,",
+  sum(locus_cor_df$Type == "DMR"), "DMRs )\n"
+)
+write.csv(
+  locus_cor_df,
+  file = file.path(
+    save_dir, "linear_model", "all_assoc_summaries_CpG_DMR_FDR_MCI.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

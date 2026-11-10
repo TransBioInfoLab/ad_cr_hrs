@@ -1,0 +1,418 @@
+---
+title: "Smoking sensitivity analysis: primary vs Smoking_Adjusted"
+subtitle: "Comparisons for Supplementary Table 3"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(IRanges)
+  library(GenomicRanges)
+  library(writexl)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+region_dir <- file.path(analysis_dir, "data", "combp_region")
+save_dir <- file.path(analysis_dir, "analysis-results")
+model_dir <- file.path(save_dir, "linear_model")
+dmr_dir <- file.path(save_dir, "comb-p-DMRs")
+out_dir <- file.path(save_dir, "sensitivity_analysis")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Overview
+
+Four comparisons of the primary analysis with the `Smoking_Adjusted` analysis
+(memory residual additionally adjusted for the SSc DNAm smoking score):
+
+1. **CpG, uncorrected:** the significant individual CpGs, interaction estimate,
+   SE and P-value before BACON (`02a`).
+2. **CpG, BACON:** the same CpGs, BACON-adjusted values (`02b`).
+3. **DMR, overlapping regions:** the significant primary DMRs (`02d`) against
+   the smoking-adjusted comb-p regions that overlap them (`02c`/`02d`, run with
+   `--seed 0.05 --region-filter-p 1.0`, no significance filter).
+4. **DMR, fixed regions:** the significant primary DMRs retested with
+   `comb-p region_p` on the same boundaries, with primary and with
+   smoking-adjusted P-values (`03a`).
+
+Each comparison is saved as a CSV and as one sheet of
+`Smoking_Sensitivity_Comparisons.xlsx`, together with a summary sheet.
+
+# Define Functions
+
+## Helpers
+
+```{r func_helpers}
+get_direction <- function(estimate) {
+  dplyr::case_when(
+    estimate > 0 ~ "+",
+    estimate < 0 ~ "-",
+    TRUE ~ "."
+  )
+}
+
+# "chr1:100-200" -> chr, start, end (keeps the DMR column)
+split_dmr <- function(df) {
+  df %>%
+    tidyr::separate_wider_delim(
+      cols = "DMR", delim = ":", names = c("chr", "pos"), cols_remove = FALSE
+    ) %>%
+    tidyr::separate_wider_delim(
+      cols = "pos", delim = "-", names = c("start", "end")
+    ) %>%
+    dplyr::mutate(
+      start = as.integer(.data$start),
+      end = as.integer(.data$end)
+    ) %>%
+    as.data.frame()
+}
+
+# GRanges from the chr, start and end columns of a data frame
+make_granges <- function(df) {
+  GenomicRanges::GRanges(
+    seqnames = df$chr,
+    ranges = IRanges::IRanges(start = df$start, end = df$end)
+  )
+}
+
+# Left join cond_df onto base_df by overlapping genomic ranges. A primary DMR
+# that overlaps several regions gets one row per overlapping region.
+merge_by_overlap <- function(base_df, cond_df) {
+  hits <- GenomicRanges::findOverlaps(
+    make_granges(base_df), make_granges(cond_df)
+  )
+  overlap_df <- data.frame(
+    base_id = S4Vectors::queryHits(hits),
+    cond_id = S4Vectors::subjectHits(hits)
+  )
+
+  base_df <- base_df %>%
+    dplyr::mutate(base_id = dplyr::row_number())
+  cond_df <- cond_df %>%
+    dplyr::mutate(cond_id = dplyr::row_number()) %>%
+    dplyr::select(-c("chr", "start", "end"))
+
+  base_df %>%
+    dplyr::left_join(overlap_df, by = "base_id") %>%
+    dplyr::left_join(cond_df, by = "cond_id") %>%
+    dplyr::select(-"base_id", -"cond_id")
+}
+```
+
+## CpG Comparisons
+
+```{r func_cpg}
+get_significant_cpgs <- function() {
+  read.csv(file.path(dmr_dir, "interact_mQTLs_inputs.csv")) %>%
+    dplyr::filter(
+      .data$Sources %in% c("DMR and Individual CpG", "individual CpG")
+    ) %>%
+    dplyr::pull("cpgs")
+}
+
+# corrected = FALSE: 02a output (EAP_stats.csv), *_interact columns
+# corrected = TRUE:  02b output (EAP_stats_bacon_interact.csv), *_bacon columns
+read_cpg_stats <- function(prefix, corrected, analysis) {
+  if (corrected) {
+    fname <- paste0(prefix, "EAP_stats_bacon_interact.csv")
+    cols <- c("estimate_bacon", "std_error_bacon", "pvalue_bacon")
+  } else {
+    fname <- paste0(prefix, "EAP_stats.csv")
+    cols <- c("estimate_interact", "std_error_interact", "pvalue_interact")
+  }
+
+  stats_df <- read.csv(file.path(model_dir, fname))
+  out_df <- data.frame(
+    CpG = stats_df$CpG,
+    Estimate = stats_df[[cols[1]]],
+    StdErr = stats_df[[cols[2]]],
+    pValue = stats_df[[cols[3]]]
+  )
+  out_df$direction <- get_direction(out_df$Estimate)
+  colnames(out_df)[-1] <- paste0(analysis, "_", colnames(out_df)[-1])
+
+  out_df
+}
+
+get_cpg_annotation <- function() {
+  read.csv(file.path(model_dir, "EAP_stats.csv")) %>%
+    dplyr::select(
+      "CpG", "Chr", "Position", "UCSC_RefGene_Name", "GREAT_annotation"
+    )
+}
+
+compare_cpgs <- function(corrected) {
+  cpg_ls <- get_significant_cpgs()
+
+  get_cpg_annotation() %>%
+    dplyr::filter(.data$CpG %in% cpg_ls) %>%
+    dplyr::left_join(
+      read_cpg_stats("", corrected, "Primary"), by = "CpG"
+    ) %>%
+    dplyr::left_join(
+      read_cpg_stats("Smoking_Adjusted_", corrected, "Smoking"), by = "CpG"
+    ) %>%
+    dplyr::mutate(
+      Estimate_change_pct = 100 *
+        (.data$Smoking_Estimate - .data$Primary_Estimate) /
+        abs(.data$Primary_Estimate),
+      Same_direction = .data$Primary_direction == .data$Smoking_direction
+    ) %>%
+    dplyr::arrange(.data$Primary_pValue)
+}
+```
+
+## DMR Comparisons
+
+```{r func_dmr}
+read_dmr_stats <- function(fname, analysis) {
+  read.csv(file.path(dmr_dir, fname)) %>%
+    split_dmr() %>%
+    dplyr::select(
+      "chr", "start", "end",
+      "{analysis}_DMR" := "DMR",
+      "{analysis}_nProbes" := "n_probes",
+      "{analysis}_pValue" := "P.value",
+      "{analysis}_Sidak-P" := "Sidak.P",
+      "{analysis}_direction" := "direction"
+    )
+}
+
+get_primary_dmrs <- function() {
+  read.csv(file.path(dmr_dir, "interact_DMRs.csv")) %>%
+    split_dmr() %>%
+    dplyr::select(
+      "DMR", "chr", "start", "end", "UCSC_RefGene_Name", "GREAT_annotation",
+      Primary_nProbes = "n_probes",
+      Primary_pValue = "P.value",
+      `Primary_Sidak-P` = "Sidak.P",
+      Primary_direction = "direction"
+    )
+}
+
+# Comparison 3: significant primary DMRs vs overlapping smoking-adjusted regions
+compare_dmr_overlap <- function() {
+  base_df <- get_primary_dmrs()
+  cond_df <- read_dmr_stats("Smoking_Adjusted_interact_DMRs.csv", "Smoking")
+
+  merge_by_overlap(base_df, cond_df) %>%
+    dplyr::mutate(
+      Smoking_significant = .data$`Smoking_Sidak-P` < 0.05
+    ) %>%
+    dplyr::select(-"chr", -"start", -"end")
+}
+
+# direction string of the BACON interaction estimates of the CpGs in each region
+add_region_direction <- function(region_df, prefix) {
+  stats_df <- read.csv(
+    file.path(model_dir, paste0(prefix, "EAP_stats_bacon_interact.csv"))
+  ) %>%
+    dplyr::filter(!(.data$Chr %in% c("chrX", "chrY"))) %>%
+    dplyr::arrange(.data$Chr, .data$Position)
+
+  region_gr <- make_granges(region_df)
+  cpg_gr <- GenomicRanges::GRanges(
+    seqnames = stats_df$Chr,
+    ranges = IRanges::IRanges(start = stats_df$Position, width = 1)
+  )
+  hits <- GenomicRanges::findOverlaps(region_gr, cpg_gr) %>%
+    as.data.frame() %>%
+    dplyr::mutate(
+      direction = get_direction(stats_df$estimate_bacon[.data$subjectHits])
+    ) %>%
+    dplyr::group_by(.data$queryHits) %>%
+    dplyr::summarise(direction = paste0(.data$direction, collapse = ""))
+
+  region_df <- region_df %>%
+    dplyr::mutate(queryHits = dplyr::row_number()) %>%
+    dplyr::left_join(hits, by = "queryHits") %>%
+    dplyr::select(-"queryHits")
+
+  region_df
+}
+
+read_region_retest <- function(label, prefix, analysis) {
+  fname <- file.path(region_dir, label, "interact_dmrs_retested.bed")
+
+  readr::read_table(fname, show_col_types = FALSE) %>%
+    as.data.frame() %>%
+    dplyr::rename(chr = "#chrom") %>%
+    add_region_direction(prefix) %>%
+    dplyr::mutate(nProbes = nchar(.data$direction)) %>%
+    dplyr::select(
+      "chr",
+      "start",
+      "end",
+      "{analysis}_nProbes" := "nProbes",
+      "{analysis}_pValue" := "slk_p",
+      "{analysis}_Sidak-P" := "slk_sidak_p",
+      "{analysis}_direction" := "direction"
+    )
+}
+
+# Comparison 4: the 03a region_p retests on the significant DMR boundaries
+compare_dmr_region <- function() {
+  base_df <- get_primary_dmrs() %>%
+    dplyr::select(
+      "DMR", "chr", "start", "end", "UCSC_RefGene_Name", "GREAT_annotation"
+    )
+  primary_df <- read_region_retest("Primary", "", "Primary_retest")
+  smoking_df <- read_region_retest(
+    "Smoking_Adjusted", "Smoking_Adjusted_", "Smoking_retest"
+  )
+
+  merge_by_overlap(base_df, primary_df) %>%
+    merge_by_overlap(smoking_df) %>%
+    dplyr::mutate(
+      Same_direction =
+        .data$Primary_retest_direction == .data$Smoking_retest_direction,
+      Smoking_significant = .data$`Smoking_retest_Sidak-P` < 0.05
+    ) %>%
+    dplyr::select(-"chr", -"start", -"end")
+}
+```
+
+## Summary
+
+```{r func_summary}
+summarize_cpg <- function(df, comparison) {
+  data.frame(
+    Comparison = comparison,
+    Loci = nrow(df),
+    Same_direction = sum(df$Same_direction, na.rm = TRUE),
+    Primary_significant = sum(df$Primary_pValue < 1e-5, na.rm = TRUE),
+    Smoking_significant = sum(df$Smoking_pValue < 1e-5, na.rm = TRUE),
+    Significance_rule = "P < 1e-5",
+    Estimate_correlation = stats::cor(df$Primary_Estimate, df$Smoking_Estimate),
+    Max_abs_estimate_change_pct = max(abs(df$Estimate_change_pct), na.rm = TRUE)
+  )
+}
+
+summarize_dmr <- function(df, comparison, primary_col, smoking_col) {
+  data.frame(
+    Comparison = comparison,
+    Loci = dplyr::n_distinct(df$DMR),
+    Rows = nrow(df),
+    Unmatched = sum(is.na(df[[smoking_col]])),
+    Primary_significant = sum(df[[primary_col]] < 0.05, na.rm = TRUE),
+    Smoking_significant = sum(df[[smoking_col]] < 0.05, na.rm = TRUE),
+    Significance_rule = "Sidak-P < 0.05"
+  )
+}
+```
+
+# Run Comparisons
+
+## CpGs
+
+```{r run_cpg}
+cpg_raw_df <- compare_cpgs(corrected = FALSE)
+cpg_bacon_df <- compare_cpgs(corrected = TRUE)
+
+stopifnot(nrow(cpg_bacon_df) == length(unique(cpg_bacon_df$CpG)))
+cat("Significant individual CpGs:", nrow(cpg_bacon_df), "\n")
+```
+
+## DMRs
+
+```{r run_dmr}
+dmr_overlap_df <- compare_dmr_overlap()
+dmr_region_df <- compare_dmr_region()
+
+cat("Significant DMRs:", dplyr::n_distinct(dmr_overlap_df$DMR), "\n")
+```
+
+## Summary
+
+```{r run_summary}
+summary_df <- dplyr::bind_rows(
+  summarize_cpg(cpg_raw_df, "1. CpG, uncorrected"),
+  summarize_cpg(cpg_bacon_df, "2. CpG, BACON"),
+  summarize_dmr(
+    dmr_overlap_df, "3. DMR, overlapping regions",
+    "Primary_Sidak-P", "Smoking_Sidak-P"
+  ),
+  summarize_dmr(
+    dmr_region_df, "4. DMR, fixed regions (region_p)",
+    "Primary_retest_Sidak-P", "Smoking_retest_Sidak-P"
+  )
+)
+
+summary_df
+```
+
+# Save
+
+```{r save}
+write.csv(
+  cpg_raw_df,
+  file.path(out_dir, "Smoking_CpG_Comparison_uncorrected.csv"),
+  row.names = FALSE
+)
+write.csv(
+  cpg_bacon_df,
+  file.path(out_dir, "Smoking_CpG_Comparison_bacon.csv"),
+  row.names = FALSE
+)
+write.csv(
+  dmr_overlap_df,
+  file.path(out_dir, "Smoking_DMR_Comparison_overlap.csv"),
+  row.names = FALSE
+)
+write.csv(
+  dmr_region_df,
+  file.path(out_dir, "Smoking_DMR_Comparison_region.csv"),
+  row.names = FALSE
+)
+
+writexl::write_xlsx(
+  list(
+    Summary = summary_df,
+    CpG_uncorrected = cpg_raw_df,
+    CpG_bacon = cpg_bacon_df,
+    DMR_overlap = dmr_overlap_df,
+    DMR_region = dmr_region_df
+  ),
+  file.path(out_dir, "Smoking_Sensitivity_Comparisons.xlsx")
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

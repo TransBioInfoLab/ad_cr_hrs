@@ -1,0 +1,339 @@
+---
+title: "Run pathway analysis"
+subtitle: "Get significant KEGG, Reactome, and GO pathways based on linear analysis results"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(msigdbr)
+  library(writexl)
+  library(methylGSA)
+  library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data", "combp")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results")
+```
+
+# Define Functions
+
+## Load Data
+
+```{r func_load}
+get_analysis_results <- function(label) {
+  save_name <- file.path(
+    save_dir,
+    "linear_model",
+    paste0("EAP_stats_bacon_", label, ".csv")
+  )
+
+  stats_df <- read.csv(save_name)
+
+  stats_df
+}
+```
+
+## Run methylRRA Analysis
+
+```{r func_methylrra}
+get_go_biology <- function() {
+  m_df <- msigdbr::msigdbr(
+    species = "Homo sapiens", collection = "C5", subcollection = "GO:BP"
+  )
+  target_ls <- m_df %>%
+    dplyr::pull("gs_exact_source") %>%
+    unique()
+
+  target_ls
+}
+
+# methylRRA GSEA for one gene set collection, sorted by P-value and labeled
+# with the collection name in the method column
+run_methylrra <- function(cpg_ls, array.type, gs_type) {
+  set.seed(23)
+  methylGSA::methylRRA(
+    cpg.pval = cpg_ls,
+    array.type = array.type,
+    method = "GSEA",
+    GS.type = gs_type,
+    minsize = 5,
+    maxsize = 200
+  ) %>%
+    dplyr::arrange(.data$pvalue) %>%
+    dplyr::mutate(method = gs_type)
+}
+
+# Keep pathways with at least `min_genes` core enrichment genes
+filter_core_enrichment <- function(pathway_df, min_genes = 3) {
+  pathway_df %>%
+    dplyr::mutate(
+      core_enrichment_count = stringr::str_count(
+        .data$core_enrichment, "[/]"
+      ) + 1
+    ) %>%
+    dplyr::filter(.data$core_enrichment_count >= min_genes)
+}
+
+get_cpg_pathways <- function(cpg_ls, array.type = c("450K", "EPIC")) {
+  array.type <- match.arg(array.type)
+
+  kegg_df <- run_methylrra(cpg_ls, array.type, "KEGG") %>%
+    filter_core_enrichment()
+
+  react_df <- run_methylrra(cpg_ls, array.type, "Reactome") %>%
+    filter_core_enrichment()
+
+  # GO is restricted to biological processes, with the FDR recomputed for them
+  bio_ls <- get_go_biology()
+  go_df <- run_methylrra(cpg_ls, array.type, "GO") %>%
+    dplyr::filter(.data$ID %in% bio_ls) %>%
+    dplyr::mutate(padj = stats::p.adjust(.data$pvalue, method = "fdr")) %>%
+    filter_core_enrichment()
+
+  rbind(kegg_df, react_df, go_df)
+}
+
+get_stats_pathways <- function(stats_df, array.type = c("450K", "EPIC")) {
+  array.type <- match.arg(array.type)
+
+  cpg_ls <- stats_df %>%
+    dplyr::pull("pvalue_bacon", name = "CpG")
+
+  pathway_df <- get_cpg_pathways(cpg_ls, array.type = array.type)
+
+  pathway_df
+}
+
+get_pathway_annotation <- function(pathway_df, anno_df) {
+  anno_df <- anno_df %>%
+    tidyr::separate_longer_delim(
+      c("UCSC_RefGene_Name", "UCSC_RefGene_Group"), delim = ";"
+    ) %>%
+    dplyr::distinct() %>%
+    dplyr::mutate(
+      UCSC_RefGene_Name = trimws(.data$UCSC_RefGene_Name),
+      UCSC_RefGene_Group = trimws(.data$UCSC_RefGene_Group)
+    ) %>%
+    dplyr::distinct()
+
+  gene_df <- pathway_df %>%
+    dplyr::select("ID", "core_enrichment") %>%
+    tidyr::separate_rows("core_enrichment", sep = "/") %>%
+    dplyr::distinct() %>%
+    dplyr::rename(UCSC_RefGene_Name = "core_enrichment") %>%
+    dplyr::left_join(anno_df, by = "UCSC_RefGene_Name", relationship = "many-to-many") %>%
+    dplyr::distinct()
+
+  gene_df
+}
+
+run_pathway_analysis <- function(
+    stats_df, anno_df, array.type = c("450K", "EPIC")
+) {
+  array.type <- match.arg(array.type)
+
+  pathway_df <- get_stats_pathways(stats_df, array.type = array.type)
+
+  gene_df <- get_pathway_annotation(pathway_df, anno_df)
+
+  list(pathway_df = pathway_df, gene_df = gene_df)
+}
+```
+
+## Save Results
+
+```{r func_save}
+# Pathways from one method (KEGG, Reactome, or GO), without the method column
+get_method_pathways <- function(pathway_df, method_name) {
+  pathway_df %>%
+    dplyr::filter(.data$method == method_name) %>%
+    dplyr::select(-"method")
+}
+
+# Genes of the nominally significant (P < 0.05) pathways from one method
+get_method_genes <- function(gene_df, pathway_df, method_name) {
+  signif_ids <- pathway_df %>%
+    dplyr::filter(.data$method == method_name) %>%
+    dplyr::filter(.data$pvalue < 0.05) %>%
+    dplyr::pull("ID")
+
+  gene_df %>%
+    dplyr::filter(.data$ID %in% signif_ids)
+}
+
+save_pathway_analysis <- function(pathway_df, gene_df, label) {
+  write_dir <- file.path(save_dir, "eQTM_probes")
+
+  writexl::write_xlsx(
+    list(
+      KEGG = get_method_pathways(pathway_df, "KEGG"),
+      Reactome = get_method_pathways(pathway_df, "Reactome"),
+      GO = get_method_pathways(pathway_df, "GO"),
+      Kegg_Genes = get_method_genes(gene_df, pathway_df, "KEGG"),
+      Reactome_Genes = get_method_genes(gene_df, pathway_df, "Reactome"),
+      GO_Genes = get_method_genes(gene_df, pathway_df, "GO")
+    ),
+    file.path(write_dir, paste0(label, "_methylGSA_pathway_analysis.xlsx"))
+  )
+}
+```
+
+## Wrapper Functions
+
+```{r func_wrapper}
+run_full_analysis <- function(label) {
+  stats_df <- get_analysis_results(label = label)
+  anno_df <- stats_df %>%
+    dplyr::select(
+      Name = "CpG",
+      "UCSC_RefGene_Name",
+      "UCSC_RefGene_Group"
+    )
+
+  stats_res <- run_pathway_analysis(stats_df, anno_df, array.type = "EPIC")
+  pathway_df <- stats_res$pathway_df
+  gene_df <- stats_res$gene_df
+
+  save_pathway_analysis(pathway_df, gene_df, label = label)
+
+  pathway_df
+}
+```
+
+## Plot
+
+```{r func_plot}
+plot_pathway <- function(pathway_df, title, thresh_fdr = 0.05, ylim = 1e-5) {
+  plot_df <- pathway_df %>%
+    dplyr::filter(.data$padj <= thresh_fdr) %>%
+    dplyr::mutate(logp = -log10(.data$pvalue)) %>%
+    dplyr::arrange(.data$pvalue) %>%
+    dplyr::mutate(
+      signif = ifelse(.data$padj < 0.05, "Significant", "Not_significant"),
+      ordering = dplyr::row_number(),
+      label = ifelse(nchar(.data$Description) < 80, .data$Description, .data$ID),
+      label = factor(.data$label, levels = .data$label)
+    )
+
+  group.colors <- c(Significant = "#6496CD", Not_significant = "#D55E00")
+
+  p <- ggplot2::ggplot(
+    plot_df, mapping = ggplot2::aes(x = label, y = logp, fill = signif)
+  ) +
+    ggplot2::geom_col(orientation = "x", width = 0.6) +
+    ggplot2::coord_flip() +
+    ggplot2::scale_y_continuous(
+      expand = c(0, 0),
+      limits = c(0, -log10(ylim)),
+      labels = function(x) sprintf("%.0f", x),
+      breaks = seq(0, -log10(ylim), by = 2)
+    ) +
+    ggplot2::scale_fill_manual(values = group.colors) +
+    ggplot2::theme_classic() +
+    ggplot2::ylab(expression("-log"["10"]~"(p)")) +
+    ggplot2::xlab("") +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(
+      plot.margin = ggplot2::margin(0.5, 0.5, 0.5, 0.5, unit = "cm"),
+      plot.title = ggplot2::element_text(size = 15, face = "bold"),
+      strip.text.y = ggplot2::element_blank(),
+      strip.placement = "outside",
+      axis.title.x = ggplot2::element_text(
+        margin = ggplot2::margin(t = 0.5, b = 0.5, unit = "cm")
+      ),
+      axis.title.y = ggplot2::element_blank(),
+      axis.text = ggplot2::element_text(size = 10, color = "black"),
+      legend.position = "right",
+      panel.grid.major.y = ggplot2::element_blank(),
+      legend.title = ggplot2::element_blank()
+    )
+
+  p
+}
+```
+
+# Run Analysis for DNAm*pTau
+
+## Analyze
+
+```{r analyze_interact}
+pathway_df <- run_full_analysis(label = "interact")
+```
+
+## Plot KEGG
+
+```{r kegg_interact, fig.height = 4, fig.width = 12}
+plot_pathway(
+  pathway_df %>%
+    dplyr::filter(.data$method == "KEGG"),
+  title = "KEGG",
+  thresh_fdr = 0.30,
+  ylim = 1e-5
+)
+```
+
+## Plot Reactome
+
+```{r reactome_interact, fig.height = 6, fig.width = 12}
+plot_pathway(
+  pathway_df %>%
+    dplyr::filter(.data$method == "Reactome"),
+  title = "Reactome",
+  thresh_fdr = 0.15,
+  ylim = 1e-5
+)
+```
+
+## Plot GO
+
+```{r go_interact, fig.height = 6, fig.width = 12}
+plot_pathway(
+  pathway_df %>%
+    dplyr::filter(.data$method == "GO"),
+  title = "GO",
+  thresh_fdr = 0.7,
+  ylim = 1e-6
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

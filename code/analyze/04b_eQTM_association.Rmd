@@ -1,0 +1,274 @@
+---
+title: "Find overlap of significant CpGs and DMRs with eQTM study results"
+author:
+  - David Lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: lumen
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(readr)
+  library(dplyr)
+  library(readxl)
+  library(rtracklayer)
+  library(liftOver)
+})
+
+base_dir <- rprojroot::find_root(
+  rprojroot::has_dir("AD_CR_HRS"),
+  path = here::here()
+)
+analysis_dir <- file.path(base_dir, "AD_CR_HRS")
+data_dir <- file.path(analysis_dir, "data")
+hrs_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION", "data")
+reference_dir <- file.path(analysis_dir, "data", "ref_files")
+save_dir <- file.path(analysis_dir, "analysis-results")
+code_dir <- file.path(analysis_dir, "code", "R")
+
+source(file.path(code_dir, "annotation_functions.R"))
+```
+
+# Define Functions
+
+## Load Data
+
+```{r func_load}
+load_probes <- function() {
+  save_name <- file.path(
+    save_dir,
+    "linear_model",
+    "EAP_stats_bacon_interact.csv"
+  )
+  cpg_df <- read.csv(file = save_name) %>%
+    dplyr::select(
+      "CpG",
+      chr = "Chr",
+      position = "Position",
+      "GREAT_annotation",
+      "Relation_to_Island"
+    ) %>%
+    dplyr::mutate(
+      Relation_to_Island = filter_column(.data$Relation_to_Island)
+    )
+
+  cpg_df
+}
+
+get_signif_probes <- function(cpg_df) {
+  read_name <- file.path(
+    save_dir, "comb-p-DMRs", "interact_mQTLs_inputs.csv"
+  )
+  sig_df <- read.csv(read_name) %>%
+    dplyr::rename(CpG = "cpgs") %>%
+    dplyr::left_join(cpg_df, by = "CpG")
+
+  sig_df
+}
+```
+
+## Load eQTM Results
+
+```{r func_eqtm}
+get_eqtm_types <- function() {
+  col_types <- c(
+    "text",
+    "text",
+    "numeric",
+    "numeric",
+    "numeric",
+    "text",
+    "numeric",
+    "text",
+    "numeric",
+    "numeric",
+    "text"
+  )
+
+  col_types
+}
+
+convert_hg19_to_hg38 <- function(df) {
+  path <- file.path(reference_dir, "hg19ToHg38.over.chain")
+  ch <- rtracklayer::import.chain(path)
+
+  df <- df %>%
+    dplyr::mutate(index = dplyr::row_number())
+
+  gr <- df %>%
+    dplyr::select(
+      "index",
+      seqnames = "transcript_chr",
+      start = "transcript_start",
+      end = "transcript_end"
+    ) %>%
+    GenomicRanges::makeGRangesFromDataFrame(
+      keep.extra.columns = TRUE
+    )
+
+  GenomeInfoDb::seqlevelsStyle(gr) <- "UCSC"
+  df_38 <- gr %>%
+    rtracklayer::liftOver(ch) %>%
+    as.data.frame() %>%
+    dplyr::rename(
+      transcript_chr = "seqnames",
+      transcript_start = "start",
+      transcript_end = "end"
+    )
+
+  df <- df %>%
+    dplyr::select(
+      -"transcript_start",
+      -"transcript_end",
+      -"transcript_chr"
+    ) %>%
+    dplyr::left_join(
+      df_38,
+      by = "index",
+      relationship = "one-to-many"
+    ) %>%
+    dplyr::select(-"index")
+
+  df
+}
+
+read_eqtm_sheet <- function(sheet) {
+  fname <- file.path(
+    reference_dir,
+    "eQTm_FHS_array_ClinicalEpigenetics_13148_2021_1041_MOESM2_ESM.xlsx"
+  )
+
+  col_types <- get_eqtm_types()
+
+  eqtm_df <- readxl::read_excel(
+    fname,
+    sheet = sheet,
+    skip = 1,
+    col_types = col_types
+  ) %>%
+    as.data.frame() %>%
+    dplyr::select(
+      "CpG",
+      "GeneSymbol",
+      transcript_chr = "transcript-chromosome",
+      transcript_start = "transcript-start",
+      transcript_end = "transcript-end",
+      T_value = "T value",
+      "log10P"
+    ) %>%
+    dplyr::mutate(
+      transcript_chr = paste0("chr", .data$transcript_chr)
+    )
+
+  eqtm_df <- convert_hg19_to_hg38(eqtm_df)
+
+  eqtm_df
+}
+```
+
+## Find Overlaps
+
+```{r func_overlap}
+get_overlaps <- function(signif_df, eqtm_df) {
+  result_df <- signif_df %>%
+    dplyr::inner_join(
+      eqtm_df,
+      by = "CpG",
+      relationship = "one-to-many"
+    ) %>%
+    dplyr::select(
+      "CpG",
+      "chr",
+      "position",
+      "GREAT_annotation",
+      "Relation_to_Island",
+      "GeneSymbol",
+      "transcript_chr",
+      "transcript_start",
+      "transcript_end",
+      "T_value",
+      "log10P",
+      "Sources"
+    )
+
+  result_df
+}
+```
+
+## Save
+
+```{r func_save}
+save_results <- function(cis_df, trans_df) {
+  write_dir <- file.path(save_dir, "eQTM_probes")
+  write.csv(
+    cis_df,
+    file = file.path(write_dir, "eQTM_Overlaps_cis.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    trans_df,
+    file = file.path(write_dir, "eQTM_Overlaps_trans.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+## Wrapper Function
+
+```{r func_wrapper}
+analysis_wrapper <- function(cpg_df, cis_df, trans_df) {
+  sig_df <- get_signif_probes(cpg_df)
+
+  cis_df <- get_overlaps(sig_df, cis_df)
+  trans_df <- get_overlaps(sig_df, trans_df)
+
+  save_results(cis_df, trans_df)
+}
+```
+
+# Run Analysis
+
+## Get Data
+
+```{r load}
+cpg_df <- load_probes()
+cis_df <- read_eqtm_sheet("Table S2")
+trans_df <- read_eqtm_sheet("Table S3")
+```
+
+## Analyze
+
+```{r analyze}
+analysis_wrapper(cpg_df, cis_df, trans_df)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>
